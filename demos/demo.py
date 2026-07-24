@@ -102,7 +102,7 @@ def main():
     points = [rng.randrange(1, r) * G for _ in range(m)]
     scalars = [rng.randrange(r) for _ in range(m)]
     t0 = time.perf_counter()
-    S = ff.msm(points, scalars)
+    ff.msm(points, scalars)
     dt = time.perf_counter() - t0
     print(f"MSM of {m} BN254-G1 points, 254-bit scalars: {dt*1e3:.0f} ms")
     # spot check against a direct sum of the first few terms

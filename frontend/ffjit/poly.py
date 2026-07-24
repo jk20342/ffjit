@@ -11,7 +11,7 @@ from typing import List, Sequence, Union
 
 from .array import FieldArray
 from .field import FieldVal
-from .ntt import get_plan, two_adicity, _pointwise_mul
+from .ntt import _pointwise_mul, get_plan, two_adicity
 
 # below this result size, schoolbook beats NTT plan setup + transforms
 _NTT_THRESHOLD = 64

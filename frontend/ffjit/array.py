@@ -10,7 +10,7 @@ Falls back to a ``bytearray`` buffer when numpy is unavailable.
 
 from __future__ import annotations
 
-from typing import Iterable, List
+from typing import List
 
 from .field import num_limbs
 

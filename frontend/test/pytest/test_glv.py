@@ -5,7 +5,7 @@ import random
 import pytest
 
 import ffjit as ff
-from ffjit.curve import _glv_decompose, _glv_short_basis, _round_div
+from ffjit.curve import _glv_decompose, _round_div
 
 GROUPS = {
     "bn254_g1": ff.bn254_g1,

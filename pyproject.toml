@@ -31,3 +31,6 @@ ignore = [
     "E501",  # long lines in generated-IR string builders are clearer unwrapped
     "E741",  # I is the standard EFD variable name in the add formulas
 ]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ffjit"]

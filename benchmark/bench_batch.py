@@ -92,7 +92,6 @@ def try_galois(p, ai, bi, coeffs):
     """Return (t_mul, t_horner) or None if galois unusable for this prime."""
     try:
         import galois
-        import numpy as np
     except Exception:
         return None
     signal.signal(signal.SIGALRM, _alarm)
