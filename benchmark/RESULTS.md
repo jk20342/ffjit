@@ -1,5 +1,26 @@
 # Benchmark results
 
+## Native orchestration and compiler options
+
+Current measurements from `benchmark/perf.py` on the development host:
+
+| workload | native/new path | reference path | result |
+|---|---:|---:|---:|
+| BN254 NTT, n=4096 | 3.42 ms | 3.71 ms | native 7.8% faster |
+| BN254 MSM, n=128 | 25.41 ms | 22.62 ms | native scheduler 12.3% slower |
+| BN254 inversion, 256 elements | 0.80 ms runtime XGCD | 2.57 ms Fermat | runtime 3.2x faster |
+
+The one-call NTT path is enabled by default. The schedule-native MSM path is
+available with `FFJIT_NATIVE_MSM=1` (or `strict` for tests), but remains
+opt-in because its schedule handoff overhead currently loses to the Python
+scheduler at n=128. Generated one-call batch inversion remains enabled.
+
+The optional compact Montgomery width was also mixed in an alternating
+11-trial benchmark: BN254 batch multiplication was effectively tied
+(20.659 ms compact vs 20.731 ms generic), while the 4096-point NTT was
+slightly slower (3.644 ms vs 3.635 ms). Therefore
+`limb_specialization="auto"` continues to select the generic lowering.
+
 ## Elliptic-curve multi-scalar multiplication (Phase 3)
 
 Workload: \(\sum_i k_i P_i\) over **BN254 G1** with random points and full

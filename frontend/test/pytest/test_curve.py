@@ -169,6 +169,41 @@ def test_msm_single_point():
     assert ff.msm([G], [k]) == k * G
 
 
+def test_msm_glv_native_reference_parity(group, monkeypatch):
+    from ffjit.curve import _msm_ref
+    curve, G, r = group
+    points = [i * G for i in range(1, 9)]
+    scalars = [(i * i * 0x12345) % r for i in range(1, 9)]
+    expected = _msm_ref(points, scalars, window=3)
+    monkeypatch.setenv("FFJIT_NATIVE_MSM", "strict")
+    for window in (2, 3, 5):
+        assert ff.msm(points, scalars, window=window) == expected
+
+
+def test_msm_deterministic_128(monkeypatch):
+    curve, G, r = ff.bn254_g1()
+    points = [i * G for i in range(1, 129)]
+    scalars = [((i * 0x9E3779B1) ^ (i << 17)) % r for i in range(128)]
+    expected_scalar = sum((i + 1) * k for i, k in enumerate(scalars)) % r
+    monkeypatch.setenv("FFJIT_NATIVE_MSM", "strict")
+    assert ff.msm(points, scalars, window=5) == expected_scalar * G
+
+
+def test_msm_environment_fallback_and_strict(monkeypatch):
+    import ffjit.curve as curve_module
+    curve, G, r = ff.bn254_g1()
+
+    def unavailable():
+        raise RuntimeError("runtime unavailable")
+
+    monkeypatch.setattr(curve_module, "get_runtime", unavailable)
+    monkeypatch.setenv("FFJIT_NATIVE_MSM", "1")
+    assert ff.msm([G, -G], [7, 2]) == 5 * G
+    monkeypatch.setenv("FFJIT_NATIVE_MSM", "strict")
+    with pytest.raises(RuntimeError, match="runtime unavailable"):
+        ff.msm([G], [1])
+
+
 # ---- batch-affine internals ----
 
 def test_batch_inv():
@@ -177,6 +212,20 @@ def test_batch_inv():
     rng = random.Random(6)
     xs = [rng.randrange(1, q) for _ in range(37)]
     assert all(x * y % q == 1 for x, y in zip(xs, _batch_inv(q, xs)))
+
+
+def test_generated_batch_inv_preserves_zero(monkeypatch):
+    from ffjit.array import FieldArray
+    from ffjit.curve import _batch_inv_array
+    curve, G, r = ff.bn254_g1()
+    monkeypatch.setenv("FFJIT_NATIVE_BATCH_INV", "strict")
+    xs = [0, 1, 2, 0, curve.q - 1, 7]
+    got = _batch_inv_array(FieldArray(curve.field, xs)).to_ints()
+    assert got[0] == got[3] == 0
+    assert all(
+        inverse == (0 if value == 0 else pow(value, -1, curve.q))
+        for value, inverse in zip(xs, got)
+    )
 
 
 def test_batch_affine_add_exceptional_cases():

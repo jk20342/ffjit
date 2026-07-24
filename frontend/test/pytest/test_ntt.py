@@ -1,11 +1,14 @@
 """NTT, multi-output kernels, and Poly multiplication tests."""
 
+import importlib
 import random
 
 import pytest
 
 import ffjit as ff
-from ffjit.ntt import get_plan, root_of_unity, two_adicity
+from ffjit.ntt import NTTPlan, get_plan, root_of_unity, two_adicity
+
+ntt_module = importlib.import_module("ffjit.ntt")
 
 P_BN254 = 21888242871839275222246405745257275088548364400416034343698204186575808495617
 P_GOLDILOCKS = (1 << 64) - (1 << 32) + 1
@@ -14,6 +17,7 @@ NTT_PRIMES = [P_BN254, P_GOLDILOCKS]
 
 
 # ---- multi-output kernels ----
+
 
 @ff.jit
 def bf(a, b, w):
@@ -47,6 +51,7 @@ def test_multi_output_batch():
 
 # ---- roots of unity ----
 
+
 def test_two_adicity_known_values():
     assert two_adicity(P_BN254) == 28
     assert two_adicity(P_GOLDILOCKS) == 32
@@ -63,6 +68,7 @@ def test_root_of_unity_has_exact_order(p, k):
 
 # ---- NTT ----
 
+
 @pytest.mark.parametrize("p", NTT_PRIMES)
 def test_ntt_matches_naive_dft(p):
     F = ff.GF(p)
@@ -71,10 +77,7 @@ def test_ntt_matches_naive_dft(p):
     xs = [rng.randrange(p) for _ in range(n)]
     plan = get_plan(F, logn)
     X = plan.ntt(ff.FieldArray(F, xs)).to_ints()
-    naive = [
-        sum(xs[j] * pow(plan.w, j * k, p) for j in range(n)) % p
-        for k in range(n)
-    ]
+    naive = [sum(xs[j] * pow(plan.w, j * k, p) for j in range(n)) % p for k in range(n)]
     assert X == naive
 
 
@@ -87,6 +90,48 @@ def test_ntt_roundtrip(p, logn):
     xs = [rng.randrange(p) for _ in range(n)]
     fa = ff.FieldArray(F, xs)
     assert ff.intt(ff.ntt(fa)).to_ints() == xs
+
+
+@pytest.mark.parametrize(
+    ("p", "logn"),
+    [
+        (65537, 0),
+        (65537, 6),
+        (P_BN254, 0),
+        (P_BN254, 8),
+    ],
+)
+def test_native_ntt_matches_transform_reference(monkeypatch, p, logn):
+    monkeypatch.setenv("FFJIT_NATIVE_NTT", "strict")
+    F = ff.GF(p)
+    plan = NTTPlan(F, logn)
+    rng = random.Random(31)
+    values = [rng.randrange(p) for _ in range(1 << logn)]
+    fa = ff.FieldArray(F, values)
+
+    native_forward = plan.ntt(fa)
+    ref_forward = plan._transform_ref(fa, plan.tw_fwd)
+    assert native_forward.to_ints() == ref_forward.to_ints()
+
+    native_inverse = plan.intt(native_forward)
+    ref_inverse = plan._transform_ref(native_forward, plan.tw_inv)
+    ref_inverse = ntt_module._pointwise_mul.map(ref_inverse, plan.ninv_arr)
+    assert native_inverse.to_ints() == ref_inverse.to_ints() == values
+
+
+def test_native_ntt_compile_failure_uses_reference(monkeypatch):
+    monkeypatch.setenv("FFJIT_NATIVE_NTT", "1")
+    F = ff.GF(65537)
+    plan = NTTPlan(F, 4)
+    values = list(range(16))
+    fa = ff.FieldArray(F, values)
+
+    def fail_compile(module):
+        raise ff.CompileError("injected native NTT failure")
+
+    monkeypatch.setattr(ntt_module, "compile_raw_module", fail_compile)
+    expected = plan._transform_ref(fa, plan.tw_fwd)
+    assert plan.ntt(fa).to_ints() == expected.to_ints()
 
 
 def test_ntt_is_linear():
@@ -110,12 +155,39 @@ def test_ntt_rejects_non_power_of_two():
 
 # ---- Poly ----
 
+
 def _schoolbook(a, b, p):
     out = [0] * (len(a) + len(b) - 1)
     for i, x in enumerate(a):
         for j, y in enumerate(b):
             out[i + j] = (out[i + j] + x * y) % p
     return out
+
+
+def _cyclic_naive(a, b, p):
+    n = len(a)
+    out = [0] * n
+    for i, x in enumerate(a):
+        for j, y in enumerate(b):
+            out[(i + j) % n] = (out[(i + j) % n] + x * y) % p
+    return out
+
+
+@pytest.mark.parametrize(
+    ("p", "logn"),
+    [(65537, 0), (65537, 5), (P_BN254, 0), (P_BN254, 6)],
+)
+def test_native_fused_cyclic_mul(monkeypatch, p, logn):
+    monkeypatch.setenv("FFJIT_NATIVE_NTT", "strict")
+    F = ff.GF(p)
+    n = 1 << logn
+    rng = random.Random(32)
+    a = [rng.randrange(p) for _ in range(n)]
+    b = [rng.randrange(p) for _ in range(n)]
+    plan = NTTPlan(F, logn)
+
+    got = plan.mul(ff.FieldArray(F, a), ff.FieldArray(F, b))
+    assert got.to_ints() == _cyclic_naive(a, b, p)
 
 
 @pytest.mark.parametrize("p", NTT_PRIMES)
@@ -163,6 +235,7 @@ def test_poly_eval_agrees_with_mul():
 
 # ---- negacyclic convolution ----
 
+
 def _negacyclic_naive(a, b, p):
     """c_k = sum_{i+j = k} a_i b_j - sum_{i+j = n+k} a_i b_j (mod p)."""
     n = len(a)
@@ -185,6 +258,22 @@ def test_negacyclic_matches_naive(p, logn):
     rng = random.Random(8)
     a = [rng.randrange(p) for _ in range(n)]
     b = [rng.randrange(p) for _ in range(n)]
+    got = ff.negacyclic_mul(ff.FieldArray(F, a), ff.FieldArray(F, b))
+    assert got.to_ints() == _negacyclic_naive(a, b, p)
+
+
+@pytest.mark.parametrize(
+    ("p", "logn"),
+    [(65537, 0), (65537, 5), (P_BN254, 0), (P_BN254, 6)],
+)
+def test_native_fused_negacyclic_mul(monkeypatch, p, logn):
+    monkeypatch.setenv("FFJIT_NATIVE_NTT", "strict")
+    F = ff.GF(p)
+    n = 1 << logn
+    rng = random.Random(33)
+    a = [rng.randrange(p) for _ in range(n)]
+    b = [rng.randrange(p) for _ in range(n)]
+
     got = ff.negacyclic_mul(ff.FieldArray(F, a), ff.FieldArray(F, b))
     assert got.to_ints() == _negacyclic_naive(a, b, p)
 

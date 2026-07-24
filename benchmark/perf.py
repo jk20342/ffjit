@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
@@ -24,6 +25,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "frontend"))
 
 import ffjit as ff  # noqa: E402
+from ffjit.curve import _msm_ref  # noqa: E402
+from ffjit.ntt import NegacyclicPlan, get_plan  # noqa: E402
 
 P_BN254_R = 21888242871839275222246405745257275088548364400416034343698204186575808495617
 P_M61 = 2**61 - 1
@@ -77,13 +80,81 @@ def bench_ntt() -> float:
     return _timeit(lambda: ff.ntt(fa))
 
 
+def bench_ntt_reference() -> float:
+    """Original Python-staged NTT, retained as the native-path oracle."""
+    F = ff.GF(P_BN254_R)
+    fa = ff.FieldArray(F, [i % P_BN254_R for i in range(4096)])
+    plan = get_plan(F, 12)
+    plan._transform_ref(fa, plan.tw_fwd)
+    return _timeit(lambda: plan._transform_ref(fa, plan.tw_fwd))
+
+
+def bench_fused_poly_mul() -> float:
+    """One-call cyclic convolution over 4096 BN254 coefficients."""
+    F = ff.GF(P_BN254_R)
+    plan = get_plan(F, 12)
+    a = ff.FieldArray(F, range(4096))
+    b = ff.FieldArray(F, range(1, 4097))
+    plan.mul(a, b)
+    return _timeit(lambda: plan.mul(a, b), repeat=3)
+
+
+def bench_fused_negacyclic_mul() -> float:
+    """One-call negacyclic convolution over 1024 BN254 coefficients."""
+    F = ff.GF(P_BN254_R)
+    plan = NegacyclicPlan(F, 10)
+    a = ff.FieldArray(F, range(1024))
+    b = ff.FieldArray(F, range(1, 1025))
+    plan.mul(a, b)
+    return _timeit(lambda: plan.mul(a, b), repeat=3)
+
+
 def bench_msm() -> float:
-    """Pippenger MSM, 128 points on BN254 G1 with full-width scalars."""
+    """Default Pippenger MSM, 128 points on BN254 G1."""
     curve, G, r = ff.bn254_g1()
     pts = [k * G for k in range(2, 130)]
     ks = [pow(k, 99, r) for k in range(2, 130)]
     ff.msm(pts[:4], ks[:4])  # compile
     return _timeit(lambda: ff.msm(pts, ks), repeat=3)
+
+
+def bench_msm_native() -> float:
+    """Schedule-native Pippenger MSM on the same 128-point input."""
+    curve, G, r = ff.bn254_g1()
+    pts = [k * G for k in range(2, 130)]
+    ks = [pow(k, 99, r) for k in range(2, 130)]
+    previous = os.environ.get("FFJIT_NATIVE_MSM")
+    os.environ["FFJIT_NATIVE_MSM"] = "strict"
+    try:
+        ff.msm(pts[:4], ks[:4])
+        return _timeit(lambda: ff.msm(pts, ks), repeat=3)
+    finally:
+        if previous is None:
+            os.environ.pop("FFJIT_NATIVE_MSM", None)
+        else:
+            os.environ["FFJIT_NATIVE_MSM"] = previous
+
+
+def bench_msm_reference() -> float:
+    """Original Python Pippenger scheduler on the same 128-point input."""
+    curve, G, r = ff.bn254_g1()
+    pts = [k * G for k in range(2, 130)]
+    ks = [pow(k, 99, r) for k in range(2, 130)]
+    _msm_ref(pts[:4], ks[:4])
+    return _timeit(lambda: _msm_ref(pts, ks), repeat=3)
+
+
+def bench_inversion(strategy: str) -> float:
+    """Batch inversion throughput for one compiler lowering strategy."""
+    F = ff.GF(P_BN254_R)
+
+    @ff.jit(inv=strategy)
+    def invert(x):
+        return x.inv()
+
+    values = ff.FieldArray(F, range(1, 257))
+    invert.map(values)
+    return _timeit(lambda: invert.map(values), repeat=3)
 
 
 def bench_fixed_base() -> float:
@@ -99,8 +170,15 @@ BENCHES = {
     "scalar_call_s": bench_scalar_call,
     "batch_mul_100k_s": bench_batch_mul,
     "ntt_4096_s": bench_ntt,
+    "ntt_ref_4096_s": bench_ntt_reference,
+    "poly_fused_4096_s": bench_fused_poly_mul,
+    "negacyclic_fused_1024_s": bench_fused_negacyclic_mul,
     "msm_128_s": bench_msm,
+    "msm_native_128_s": bench_msm_native,
+    "msm_ref_128_s": bench_msm_reference,
     "fixed_base_mul_s": bench_fixed_base,
+    "inv_fermat_256_s": lambda: bench_inversion("fermat"),
+    "inv_runtime_256_s": lambda: bench_inversion("runtime"),
 }
 
 

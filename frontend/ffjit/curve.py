@@ -17,21 +17,30 @@ on coordinate triples; the exceptional cases the formulas cannot express
 Python -- for addition, Z3 = 2*Z1*Z2*H vanishes exactly on the exceptional
 set, so a zero output is the (cheap, rare) signal to take the slow path.
 
-Multi-scalar multiplication  sum_i k_i * P_i  uses Pippenger's bucket method
-with the bucket accumulation executed as *batched* tree reduction: each round
-pairs up pending points across all buckets and performs every addition in one
-call into the compiled batch kernel.
+Multi-scalar multiplication  sum_i k_i * P_i  uses Pippenger's bucket method.
+The C runtime emits a compact dependency schedule, and Python submits each
+independent round as one call into the compiled point batch kernel.
 """
 
 from __future__ import annotations
 
 import functools
+import hashlib
 import math
+import os
 from typing import List, Sequence, Tuple
 
 from .array import FieldArray
+from .compiler import compile_raw_module
+from .curvegen import generate_batch_inv_module
 from .field import GF
 from .jit import jit
+from .runtime import (
+    NO_POINT_SLOT,
+    POINT_ADD,
+    POINT_DOUBLE,
+    get_runtime,
+)
 
 
 class Curve:
@@ -464,6 +473,25 @@ class FixedBase:
         k = int(k) % self.order
         if k == 0:
             return self.curve.infinity()
+        mode = _native_msm_mode()
+        if mode not in _FALSE_MODES:
+            try:
+                schedule, ops = get_runtime().fixed_base_schedule(
+                    k, self.order.bit_length(), self.c, self.nwin
+                )
+                inputs = [
+                    Point(self.curve, x, y, 1)
+                    for row in self.table
+                    for x, y in row
+                ]
+                return _execute_schedule(self.curve, inputs, schedule, ops)
+            except Exception:
+                if mode == "strict":
+                    raise
+        return self._mul_ref(k)
+
+    def _mul_ref(self, k: int) -> Point:
+        """Original Python comb traversal, retained as a fallback oracle."""
         acc = self.curve.infinity()
         mask = (1 << self.c) - 1
         for j in range(self.nwin):
@@ -559,6 +587,20 @@ def _reduce_buckets(curve: Curve, buckets: dict) -> dict:
 
 # -- batch-affine arithmetic (Montgomery shared inversion) --
 
+_FALSE_MODES = ("0", "false", "no", "off", "python")
+_batch_inv_kernels = {}
+
+
+def _native_batch_inv_mode() -> str:
+    return os.environ.get("FFJIT_NATIVE_BATCH_INV", "1").strip().lower()
+
+
+def _native_msm_mode() -> str:
+    # Schedule-native MSM is currently workload-dependent and is slower than
+    # the Python scheduler on the reference BN254/128 benchmark. Keep it
+    # opt-in until it wins consistently; "strict" remains useful for testing.
+    return os.environ.get("FFJIT_NATIVE_MSM", "python").strip().lower()
+
 def _batch_inv(q: int, xs: List[int]) -> List[int]:
     """Invert every element of ``xs`` (all nonzero) mod q with a single
     modular inversion: prefix products, one pow(-1), back-substitution.
@@ -575,18 +617,54 @@ def _batch_inv(q: int, xs: List[int]) -> List[int]:
     return out
 
 
+def _batch_inv_array(values: FieldArray) -> FieldArray:
+    """Invert a FieldArray in one generated call, preserving zero entries."""
+    n = values.N
+    if n == 0:
+        return FieldArray(values.field, [])
+    mode = _native_batch_inv_mode()
+    if mode not in _FALSE_MODES:
+        try:
+            key = (values.field.modulus, n)
+            kernel = _batch_inv_kernels.get(key)
+            if kernel is None:
+                identity = f"{values.field.modulus}:{n}:batch_inv"
+                digest = hashlib.sha256(identity.encode("ascii")).hexdigest()[:16]
+                module = generate_batch_inv_module(
+                    f"ff_batch_inv_{digest}", values.field.modulus, n
+                )
+                kernel = compile_raw_module(module)
+                _batch_inv_kernels[key] = kernel
+            out = FieldArray(values.field, [0] * n)
+            scratch = FieldArray(values.field, [0] * n)
+            kernel(
+                [
+                    out.buffer_address(),
+                    values.buffer_address(),
+                    scratch.buffer_address(),
+                ]
+            )
+            return out
+        except Exception:
+            if mode == "strict":
+                raise
+    xs = values.to_ints()
+    nonzero = [x for x in xs if x]
+    inverses = iter(_batch_inv(values.field.modulus, nonzero))
+    return FieldArray(values.field, [next(inverses) if x else 0 for x in xs])
+
+
 Affine = Tuple[int, int]
 
 
 def _batch_normalize(curve: Curve, points: Sequence[Point]) -> List[Affine]:
-    """Jacobian -> affine for a whole batch: one shared inversion (Python)
-    plus a compiled 2-out normalization kernel. Inputs must be finite."""
+    """Jacobian -> affine using one generated shared-inversion call."""
     F = curve.field
-    zinvs = _batch_inv(curve.q, [P.Z for P in points])
+    zinvs = _batch_inv_array(FieldArray(F, [P.Z for P in points]))
     xs, ys = curve._norm.map(
         FieldArray(F, [P.X for P in points]),
         FieldArray(F, [P.Y for P in points]),
-        FieldArray(F, zinvs),
+        zinvs,
     )
     return list(zip(xs.to_ints(), ys.to_ints()))
 
@@ -608,13 +686,13 @@ def _batch_affine_add(curve: Curve, Ps: List[Affine],
     out: List[Affine | None] = [None] * n
 
     if good:
-        dinvs = _batch_inv(q, [diffs[i] for i in good])
+        dinvs = _batch_inv_array(FieldArray(F, [diffs[i] for i in good]))
         x3s, y3s = curve._aff_add.map(
             FieldArray(F, [Ps[i][0] for i in good]),
             FieldArray(F, [Ps[i][1] for i in good]),
             FieldArray(F, [Qs[i][0] for i in good]),
             FieldArray(F, [Qs[i][1] for i in good]),
-            FieldArray(F, dinvs),
+            dinvs,
         )
         for i, x3, y3 in zip(good, x3s.to_ints(), y3s.to_ints()):
             out[i] = (x3, y3)
@@ -664,28 +742,12 @@ def _default_window(n: int) -> int:
     return max(2, min(12, n.bit_length() - 4))
 
 
-def msm(points: Sequence[Point], scalars: Sequence[int], *,
-        window: int = 0) -> Point:
-    """Multi-scalar multiplication  sum_i scalars[i] * points[i].
-
-    Pippenger's algorithm: split scalars into c-bit windows; per window,
-    drop each point into the bucket of its digit, tree-reduce the buckets
-    with batched compiled additions, then combine buckets with the
-    running-sum identity  sum_d d*B_d = sum_j (running_j * gap_j).
-    """
-    if len(points) != len(scalars):
-        raise ValueError("points and scalars must have equal length")
-    if not points:
-        raise ValueError("msm of zero points is undefined")
-    curve = points[0].curve
+def _prepare_msm_pairs(curve: Curve, points, scalars):
     glv = curve._glv
-
     pairs = []
     for P, k in zip(points, scalars):
         k = int(k)
         if glv is not None:
-            # GLV: one (P, k) becomes (P, k1) and (phi(P), k2) with
-            # half-length scalars, halving the number of window passes.
             k %= glv["r"]
             if k == 0 or P.is_infinity:
                 continue
@@ -700,6 +762,78 @@ def msm(points: Sequence[Point], scalars: Sequence[int], *,
                 P, k = -P, -k
             if k and not P.is_infinity:
                 pairs.append((P, k))
+    return pairs
+
+
+def _batch_double_points(curve: Curve, points: List[Point]) -> List[Point]:
+    out: List[Point] = [None] * len(points)  # type: ignore[list-item]
+    indices = [i for i, point in enumerate(points) if not point.is_infinity]
+    if indices:
+        F = curve.field
+        X3, Y3, Z3 = curve._dbl.map(
+            FieldArray(F, [points[i].X for i in indices]),
+            FieldArray(F, [points[i].Y for i in indices]),
+            FieldArray(F, [points[i].Z for i in indices]),
+        )
+        for i, x, y, z in zip(
+            indices, X3.to_ints(), Y3.to_ints(), Z3.to_ints()
+        ):
+            out[i] = Point(curve, x, y, z)
+    for i, point in enumerate(points):
+        if point.is_infinity:
+            out[i] = point
+    return out
+
+
+def _execute_schedule(curve: Curve, inputs, schedule, ops) -> Point:
+    slots: List[Point | None] = [None] * schedule.slot_count
+    slots[:len(inputs)] = inputs
+    cursor = 0
+    while cursor < len(ops):
+        end = cursor + 1
+        while end < len(ops) and ops[end].round == ops[cursor].round:
+            end += 1
+        round_ops = ops[cursor:end]
+        adds = [op for op in round_ops if op.kind == POINT_ADD]
+        doubles = [op for op in round_ops if op.kind == POINT_DOUBLE]
+        if adds:
+            results = _batch_add_points(
+                curve,
+                [slots[op.lhs] for op in adds],
+                [slots[op.rhs] for op in adds],
+            )
+            for op, result in zip(adds, results):
+                slots[op.out] = result
+        if doubles:
+            results = _batch_double_points(
+                curve, [slots[op.lhs] for op in doubles]
+            )
+            for op, result in zip(doubles, results):
+                slots[op.out] = result
+        cursor = end
+    if schedule.result_slot == NO_POINT_SLOT:
+        return curve.infinity()
+    result = slots[schedule.result_slot]
+    if result is None:
+        raise RuntimeError("runtime point schedule produced an empty result slot")
+    return result
+
+
+def _msm_ref(points: Sequence[Point], scalars: Sequence[int], *,
+             window: int = 0) -> Point:
+    """Multi-scalar multiplication  sum_i scalars[i] * points[i].
+
+    Pippenger's algorithm: split scalars into c-bit windows; per window,
+    drop each point into the bucket of its digit, tree-reduce the buckets
+    with batched compiled additions, then combine buckets with the
+    running-sum identity  sum_d d*B_d = sum_j (running_j * gap_j).
+    """
+    if len(points) != len(scalars):
+        raise ValueError("points and scalars must have equal length")
+    if not points:
+        raise ValueError("msm of zero points is undefined")
+    curve = points[0].curve
+    pairs = _prepare_msm_pairs(curve, points, scalars)
     if not pairs:
         return curve.infinity()
 
@@ -761,6 +895,36 @@ def msm(points: Sequence[Point], scalars: Sequence[int], *,
                 result = result.double()
         result = result + acc[w]
     return result
+
+
+def msm(points: Sequence[Point], scalars: Sequence[int], *,
+        window: int = 0) -> Point:
+    """Multi-scalar multiplication with runtime-native scheduling."""
+    if len(points) != len(scalars):
+        raise ValueError("points and scalars must have equal length")
+    if not points:
+        raise ValueError("msm of zero points is undefined")
+    curve = points[0].curve
+    if any(P.curve is not curve for P in points):
+        raise ValueError("all points must belong to the same curve")
+    mode = _native_msm_mode()
+    if mode not in _FALSE_MODES:
+        try:
+            pairs = _prepare_msm_pairs(curve, points, scalars)
+            if not pairs:
+                return curve.infinity()
+            ks = [k for _, k in pairs]
+            c = window or _default_window(len(pairs))
+            schedule, ops = get_runtime().msm_schedule(
+                ks, max(k.bit_length() for k in ks), c
+            )
+            return _execute_schedule(
+                curve, [point for point, _ in pairs], schedule, ops
+            )
+        except Exception:
+            if mode == "strict":
+                raise
+    return _msm_ref(points, scalars, window=window)
 
 
 # ---------------------------------------------------------------------------

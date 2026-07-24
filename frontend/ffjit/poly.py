@@ -11,7 +11,7 @@ from typing import List, Sequence, Union
 
 from .array import FieldArray
 from .field import FieldVal
-from .ntt import _pointwise_mul, get_plan, two_adicity
+from .ntt import get_plan, two_adicity
 
 # below this result size, schoolbook beats NTT plan setup + transforms
 _NTT_THRESHOLD = 64
@@ -98,10 +98,7 @@ class Poly:
         plan = get_plan(self.field, logn)
         fa = FieldArray(self.field, self.coeffs + [0] * (n - len(self.coeffs)))
         fb = FieldArray(self.field, other.coeffs + [0] * (n - len(other.coeffs)))
-        A = plan.ntt(fa)
-        B = plan.ntt(fb)
-        C = _pointwise_mul.map(A, B)
-        c = plan.intt(C)
+        c = plan.mul(fa, fb)
         return Poly(self.field, c.to_ints()[:out_len])
 
     # -- evaluation --

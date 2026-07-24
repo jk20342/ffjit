@@ -5,6 +5,7 @@ BUILD_TYPE ?= Release
 # lit ships with some LLVM packages but not the apt.llvm.org ones;
 # fall back to a pip-installed `lit` on PATH (pip install lit).
 LIT ?= $(shell command -v /usr/lib/llvm-21/bin/lit || command -v lit || echo lit)
+CLANG_FORMAT ?= $(shell command -v clang-format-21 || command -v clang-format || echo clang-format)
 
 .PHONY: all mlir runtime frontend test test-runtime test-mlir test-frontend bench perf perf-baseline lint format clean
 
@@ -53,13 +54,15 @@ demo: mlir
 
 lint:
 	$(PYTHON) -m ruff check frontend benchmark demos
-	find mlir/lib mlir/include mlir/tools runtime \( -name '*.cpp' -o -name '*.h' \) \
-		| xargs clang-format --dry-run --Werror
+	find mlir/lib mlir/include mlir/tools runtime \
+		-name build -prune -o \( -name '*.cpp' -o -name '*.h' \) -print \
+		| xargs $(CLANG_FORMAT) --dry-run --Werror
 
 format:
 	$(PYTHON) -m ruff check --fix frontend benchmark demos
-	find mlir/lib mlir/include mlir/tools runtime \( -name '*.cpp' -o -name '*.h' \) \
-		| xargs clang-format -i
+	find mlir/lib mlir/include mlir/tools runtime \
+		-name build -prune -o \( -name '*.cpp' -o -name '*.h' \) -print \
+		| xargs $(CLANG_FORMAT) -i
 
 clean:
 	rm -rf mlir/build runtime/build

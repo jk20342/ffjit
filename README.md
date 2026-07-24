@@ -75,9 +75,31 @@ Python @ff.jit function
 - `mlir/` -- out-of-tree MLIR dialect (`field`), lowering passes, the
   `ff-opt` pass-testing tool and the `ffc` ahead-of-time compiler driver.
   Builds against system MLIR (LLVM 21).
-- `runtime/` -- C++ runtime with a stable `extern "C"` ABI (big-integer
-  modular inverse via binary extended Euclid; future home of hand-tuned
-  MSM/NTT kernels).
+- `runtime/` -- C++ runtime with a stable `extern "C"` ABI for big-integer
+  modular inverse and native MSM/fixed-base schedule generation.
+
+NTT, inverse NTT, cyclic polynomial multiplication, and negacyclic
+multiplication use fixed-size structured MLIR drivers. Bit reversal, all
+butterfly stages, pointwise multiplication, and inverse scaling execute
+inside one native entry call. The original Python-staged implementations
+remain available as correctness fallbacks.
+
+Generated batch inversion is also native. The runtime can generate MSM and
+fixed-base schedules with `FFJIT_NATIVE_MSM=1`, but that scheduler remains
+opt-in because its current n=128 benchmark is slower than Python scheduling.
+
+`@ff.jit` also accepts compiler controls:
+
+```python
+@ff.jit(inv="runtime", limb_specialization="compact")
+def f(x):
+    return (x**17 + 1).inv()
+```
+
+`inv` may be `fermat` (the default compact `scf.for` lowering) or `runtime`
+(binary extended Euclid through `libff_rt`). `limb_specialization` may be
+`generic`, `auto`, or `compact`; `auto` currently stays generic because the
+compact Montgomery width has mixed benchmark results.
 
 ## Building
 

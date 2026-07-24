@@ -17,10 +17,11 @@ from .field import FieldVal
 
 @dataclass
 class Node:
-    op: str                      # input | const | add | sub | mul | neg | inv
+    op: str  # input | const | add | sub | mul | neg | inv | pow
     field: type                  # the GF(p) subclass this value lives in
     args: Tuple["Node", ...] = ()
     const_value: Optional[int] = None
+    exponent: Optional[int] = None
     index: Optional[int] = None  # for inputs: positional arg index
     id: int = -1
 
@@ -131,18 +132,9 @@ class Tracer:
     def __pow__(self, e: int):
         if not isinstance(e, int) or e < 0:
             raise TraceError("only non-negative integer exponents are traceable")
-        # square-and-multiply over the constant exponent
-        if e == 0:
-            return self._wrap(Node("const", self.field, const_value=1))
-        result = None
-        base = self
-        while e > 0:
-            if e & 1:
-                result = base if result is None else result * base
-            e >>= 1
-            if e:
-                base = base * base
-        return result
+        if e > (1 << 63) - 1:
+            raise TraceError("field exponent exceeds the supported 63-bit bound")
+        return self._wrap(Node("pow", self.field, args=(self.node,), exponent=e))
 
 
 def trace(fn, fields) -> Tuple[TraceContext, List[Node], List[Node]]:

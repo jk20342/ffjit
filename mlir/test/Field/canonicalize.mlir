@@ -66,3 +66,41 @@ func.func @sub_self(%x: i128) -> i128 {
   %ret = field.to_int %r : !e -> i128
   return %ret : i128
 }
+
+// CHECK-LABEL: func.func @opposites
+func.func @opposites(%x: i128) -> i128 {
+  %c0 = arith.constant 0 : i128
+  %zero = field.from_int %c0 : i128 -> !e
+  %xe = field.from_int %x : i128 -> !e
+  %nx = field.neg %xe : !e
+  // x + (-x) -> 0, and 0 - x -> -x.
+  // CHECK-NOT: field.add
+  // CHECK: %[[NEG:.*]] = field.neg %{{.*}}
+  %sum = field.add %xe, %nx : !e
+  %r = field.sub %sum, %xe : !e
+  // CHECK-NOT: field.sub
+  // CHECK: field.to_int %[[NEG]]
+  %ret = field.to_int %r : !e -> i128
+  return %ret : i128
+}
+
+// CHECK-LABEL: func.func @pow_identities
+func.func @pow_identities(%x: i128) -> i128 {
+  %xe = field.from_int %x : i128 -> !e
+  // pow(x, 1) -> x, then pow(x, 0) -> 1.
+  // CHECK-NOT: field.pow
+  %same = field.pow %xe, 1 : !e
+  %one = field.pow %same, 0 : !e
+  %ret = field.to_int %one : !e -> i128
+  return %ret : i128
+}
+
+// CHECK-LABEL: func.func @inverse_literals
+func.func @inverse_literals() -> i128 {
+  %c0 = arith.constant 0 : i128
+  %zero = field.from_int %c0 : i128 -> !e
+  // CHECK-NOT: field.inv
+  %inv = field.inv %zero : !e
+  %ret = field.to_int %inv : !e -> i128
+  return %ret : i128
+}

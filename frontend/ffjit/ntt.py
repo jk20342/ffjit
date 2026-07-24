@@ -23,11 +23,15 @@ check with one squaring chain. Expected two trials.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import random
 
 from .array import FieldArray
+from .compiler import compile_raw_module
 from .field import num_limbs
 from .jit import jit
+from .nttgen import generate_mul_module, generate_ntt_module
 
 try:
     import numpy as _np
@@ -90,9 +94,7 @@ class NTTPlan:
         self.nl = num_limbs(p)
 
         if w is not None:
-            if pow(w, self.n, p) != 1 or (
-                logn > 0 and pow(w, self.n >> 1, p) == 1
-            ):
+            if pow(w, self.n, p) != 1 or (logn > 0 and pow(w, self.n >> 1, p) == 1):
                 raise ValueError(f"{w} is not a primitive 2^{logn}-th root")
             self.w = w
         else:
@@ -108,6 +110,10 @@ class NTTPlan:
 
         self.tw_fwd = self._stage_twiddles(self.w)
         self.tw_inv = self._stage_twiddles(self.winv)
+        self._native_tw_fwd = self._packed_twiddles(self.w)
+        self._native_tw_inv = self._packed_twiddles(self.winv)
+        self._native_transforms = {}
+        self._native_mul = None
 
         one = FieldArray(field, [self.ninv])
         self.ninv_arr = FieldArray(field, _np.tile(one._buf, (self.n, 1)))
@@ -129,7 +135,27 @@ class NTTPlan:
             out.append(FieldArray(self.field, tiled))
         return out
 
-    def _transform(self, fa: FieldArray, tws) -> FieldArray:
+    def _packed_twiddles(self, w: int) -> FieldArray:
+        """Twiddle powers for each stage, concatenated without block tiling."""
+        p = self.field.modulus
+        values = []
+        for stage in range(1, self.logn + 1):
+            block = 1 << stage
+            half = block >> 1
+            step = pow(w, self.n // block, p)
+            value = 1
+            for _ in range(half):
+                values.append(value)
+                value = value * step % p
+        # Size-one transforms never dereference this pointer, but a nonempty
+        # allocation keeps its raw ABI address unambiguous.
+        return FieldArray(self.field, values or [1])
+
+    def _empty_array(self) -> FieldArray:
+        return FieldArray(self.field, _np.zeros((self.n, self.nl), dtype=_np.uint64))
+
+    def _transform_ref(self, fa: FieldArray, tws) -> FieldArray:
+        """Original staged implementation, retained as fallback and oracle."""
         if fa.N != self.n or fa.field is not self.field:
             raise ValueError("input does not match this NTT plan")
         n, nl = self.n, self.nl
@@ -140,20 +166,117 @@ class NTTPlan:
             blk = 1 << st
             half = blk >> 1
             v = buf.reshape(n // blk, blk, nl)
-            A = FieldArray(self.field, _np.ascontiguousarray(v[:, :half, :]).reshape(-1, nl))
-            B = FieldArray(self.field, _np.ascontiguousarray(v[:, half:, :]).reshape(-1, nl))
+            A = FieldArray(
+                self.field, _np.ascontiguousarray(v[:, :half, :]).reshape(-1, nl)
+            )
+            B = FieldArray(
+                self.field, _np.ascontiguousarray(v[:, half:, :]).reshape(-1, nl)
+            )
             U, V = _butterfly.map(A, B, tws[st - 1])
             v[:, :half, :] = U._buf.reshape(n // blk, half, nl)
             v[:, half:, :] = V._buf.reshape(n // blk, half, nl)
         return FieldArray(self.field, buf)
 
+    @staticmethod
+    def _native_mode() -> str:
+        return os.environ.get("FFJIT_NATIVE_NTT", "1").strip().lower()
+
+    def _native_name(self, operation: str) -> str:
+        identity = f"{self.field.modulus}:{self.logn}:{operation}"
+        digest = hashlib.sha256(identity.encode("ascii")).hexdigest()[:16]
+        return f"ff_ntt_{operation}_{digest}"
+
+    def _native_transform(self, inverse: bool):
+        key = "inverse" if inverse else "forward"
+        cached = self._native_transforms.get(key)
+        if cached is None:
+            module = generate_ntt_module(
+                self._native_name(key),
+                self.field.modulus,
+                self.logn,
+                inverse=inverse,
+            )
+            cached = compile_raw_module(module)
+            self._native_transforms[key] = cached
+        return cached
+
+    def _transform(self, fa: FieldArray, *, inverse: bool) -> FieldArray:
+        if fa.N != self.n or fa.field is not self.field:
+            raise ValueError("input does not match this NTT plan")
+        tws = self.tw_inv if inverse else self.tw_fwd
+        mode = self._native_mode()
+        if mode in ("0", "false", "no", "off"):
+            out = self._transform_ref(fa, tws)
+            return _pointwise_mul.map(out, self.ninv_arr) if inverse else out
+
+        native_tw = self._native_tw_inv if inverse else self._native_tw_fwd
+        try:
+            kernel = self._native_transform(inverse)
+            out = self._empty_array()
+            kernel(
+                [
+                    out.buffer_address(),
+                    fa.buffer_address(),
+                    native_tw.buffer_address(),
+                ]
+            )
+            return out
+        except Exception:
+            if mode == "strict":
+                raise
+            out = self._transform_ref(fa, tws)
+            return _pointwise_mul.map(out, self.ninv_arr) if inverse else out
+
     def ntt(self, fa: FieldArray) -> FieldArray:
         """Forward transform: X[k] = sum_j x[j] * w^(jk), natural order."""
-        return self._transform(fa, self.tw_fwd)
+        return self._transform(fa, inverse=False)
 
     def intt(self, fa: FieldArray) -> FieldArray:
         """Inverse transform: x = n^-1 * NTT_{w^-1}(X)."""
-        out = self._transform(fa, self.tw_inv)
+        return self._transform(fa, inverse=True)
+
+    def mul(self, a: FieldArray, b: FieldArray) -> FieldArray:
+        """One-call cyclic convolution, with a staged reference fallback."""
+        if (
+            a.N != self.n
+            or b.N != self.n
+            or a.field is not self.field
+            or b.field is not self.field
+        ):
+            raise ValueError("operands do not match this NTT plan")
+        mode = self._native_mode()
+        if mode not in ("0", "false", "no", "off"):
+            try:
+                if self._native_mul is None:
+                    module = generate_mul_module(
+                        self._native_name("mul"),
+                        self.field.modulus,
+                        self.logn,
+                        negacyclic=False,
+                    )
+                    self._native_mul = compile_raw_module(module)
+                out = self._empty_array()
+                scratch_a = self._empty_array()
+                scratch_b = self._empty_array()
+                self._native_mul(
+                    [
+                        out.buffer_address(),
+                        a.buffer_address(),
+                        b.buffer_address(),
+                        scratch_a.buffer_address(),
+                        scratch_b.buffer_address(),
+                        self._native_tw_fwd.buffer_address(),
+                        self._native_tw_inv.buffer_address(),
+                    ]
+                )
+                return out
+            except Exception:
+                if mode == "strict":
+                    raise
+        left = self._transform_ref(a, self.tw_fwd)
+        right = self._transform_ref(b, self.tw_fwd)
+        product = _pointwise_mul.map(left, right)
+        out = self._transform_ref(product, self.tw_inv)
         return _pointwise_mul.map(out, self.ninv_arr)
 
 
@@ -184,6 +307,7 @@ def intt(fa: FieldArray) -> FieldArray:
 # ---------------------------------------------------------------------------
 # Negacyclic convolution (multiplication in GF(p)[x] / (x^n + 1))
 # ---------------------------------------------------------------------------
+
 
 class NegacyclicPlan:
     """Multiplication in the ring GF(p)[x] / (x^n + 1) via psi-twisting.
@@ -216,12 +340,55 @@ class NegacyclicPlan:
             ipows[i] = ipows[i - 1] * psi_inv % p
         self.psi_pows = FieldArray(field, pows)
         self.psi_inv_pows = FieldArray(field, ipows)
+        self._native_mul = None
 
     def mul(self, a: FieldArray, b: FieldArray) -> FieldArray:
+        if (
+            a.N != self.n
+            or b.N != self.n
+            or a.field is not self.field
+            or b.field is not self.field
+        ):
+            raise ValueError("operands do not match this negacyclic plan")
+        mode = self.plan._native_mode()
+        if mode not in ("0", "false", "no", "off"):
+            try:
+                if self._native_mul is None:
+                    module = generate_mul_module(
+                        self.plan._native_name("negacyclic"),
+                        self.field.modulus,
+                        self.plan.logn,
+                        negacyclic=True,
+                    )
+                    self._native_mul = compile_raw_module(module)
+                out = self.plan._empty_array()
+                scratch_a = self.plan._empty_array()
+                scratch_b = self.plan._empty_array()
+                self._native_mul(
+                    [
+                        out.buffer_address(),
+                        a.buffer_address(),
+                        b.buffer_address(),
+                        scratch_a.buffer_address(),
+                        scratch_b.buffer_address(),
+                        self.plan._native_tw_fwd.buffer_address(),
+                        self.plan._native_tw_inv.buffer_address(),
+                        self.psi_pows.buffer_address(),
+                        self.psi_inv_pows.buffer_address(),
+                    ]
+                )
+                return out
+            except Exception:
+                if mode == "strict":
+                    raise
         at = _pointwise_mul.map(a, self.psi_pows)
         bt = _pointwise_mul.map(b, self.psi_pows)
-        C = _pointwise_mul.map(self.plan.ntt(at), self.plan.ntt(bt))
-        return _pointwise_mul.map(self.plan.intt(C), self.psi_inv_pows)
+        left = self.plan._transform_ref(at, self.plan.tw_fwd)
+        right = self.plan._transform_ref(bt, self.plan.tw_fwd)
+        product = _pointwise_mul.map(left, right)
+        inverse = self.plan._transform_ref(product, self.plan.tw_inv)
+        scaled = _pointwise_mul.map(inverse, self.plan.ninv_arr)
+        return _pointwise_mul.map(scaled, self.psi_inv_pows)
 
 
 _neg_plans = {}

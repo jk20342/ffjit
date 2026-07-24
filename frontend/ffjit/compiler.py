@@ -1,6 +1,6 @@
 """Backend: lower generated MLIR to a shared object and load it via ctypes.
 
-Flow:  MLIR text --ffc--> LLVM IR  --(+ptr-ABI wrapper)--> clang -> .so -> dlopen
+Flow:  MLIR text --ffc--> LLVM IR --(+scalar ptr shim)--> clang -> .so -> dlopen
 
 Field elements cross the ABI boundary as little-endian limb buffers (pointers),
 which sidesteps platform rules for passing wide integers (``i256`` etc.) by
@@ -16,11 +16,26 @@ import os
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
 from .errors import CompileError
 from .mlirgen import GeneratedModule
+from .runtime import RUNTIME_ABI_VERSION, Runtime, find_runtime
+
+KERNEL_ABI_VERSION = 4
+RAW_ABI_VERSION = 1
+
+
+@dataclass(frozen=True)
+class RawPointerModule:
+    """Structured MLIR with one exported pointer-only function."""
+
+    text: str
+    name: str
+    nargs: int
+    requires_runtime: bool = False
 
 
 def _find_ffc() -> str:
@@ -104,53 +119,21 @@ def _abi_wrapper(mod: GeneratedModule) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _batch_wrapper(mod: GeneratedModule) -> str:
-    """LLVM IR for a batched loop:
-
-        void <name>_batch(i64 n, ptr out0, ..., ptr a0, ...)
-
-    Each buffer is a contiguous array of ``n`` elements; element ``j`` occupies
-    ``bits[j] // 8`` bytes (little-endian). We index by explicit byte offsets
-    so the stride exactly matches how the frontend packs the buffers,
-    independent of any LLVM integer alloc-size padding. clang inlines the
-    scalar kernel into this loop, so compile time is independent of ``n``.
-    """
-    nargs = len(mod.arg_bits)
-    nouts = len(mod.ret_bits)
-    out_ptrs = [f"ptr %out{k}" for k in range(nouts)]
-    arg_ptrs = [f"ptr %a{i}" for i in range(nargs)]
-    sig = ", ".join(["i64 %n"] + out_ptrs + arg_ptrs)
-    rty = _ret_type(mod)
-
-    L = [f"define void @{mod.name}_batch({sig}) {{"]
-    L.append("entry:")
-    L.append("  %pos = icmp sgt i64 %n, 0")
-    L.append("  br i1 %pos, label %loop, label %done")
-    L.append("loop:")
-    L.append("  %i = phi i64 [ 0, %entry ], [ %inext, %loop ]")
-    call_args = []
-    for j, w in enumerate(mod.arg_bits):
-        nb = w // 8
-        L.append(f"  %off{j} = mul i64 %i, {nb}")
-        L.append(f"  %p{j} = getelementptr i8, ptr %a{j}, i64 %off{j}")
-        L.append(f"  %v{j} = load i{w}, ptr %p{j}, align 8")
-        call_args.append(f"i{w} %v{j}")
-    L.append(f"  %r = call {rty} @{mod.name}({', '.join(call_args)})")
-    for k, w in enumerate(mod.ret_bits):
-        nb = w // 8
-        val = "%r" if nouts == 1 else f"%r{k}"
-        if nouts > 1:
-            L.append(f"  %r{k} = extractvalue {rty} %r, {k}")
-        L.append(f"  %ooff{k} = mul i64 %i, {nb}")
-        L.append(f"  %po{k} = getelementptr i8, ptr %out{k}, i64 %ooff{k}")
-        L.append(f"  store i{w} {val}, ptr %po{k}, align 8")
-    L.append("  %inext = add i64 %i, 1")
-    L.append("  %cont = icmp slt i64 %inext, %n")
-    L.append("  br i1 %cont, label %loop, label %done")
-    L.append("done:")
-    L.append("  ret void")
-    L.append("}")
-    return "\n".join(L) + "\n"
+def _validate_linked_runtime(lib, so_path: str) -> None:
+    """Validate the runtime dependency resolved for a compiled shared object."""
+    try:
+        abi_fn = lib.ff_rt_abi_version
+    except AttributeError as exc:
+        raise CompileError(
+            f"runtime-backed kernel {so_path!r} has no runtime ABI symbol"
+        ) from exc
+    abi_fn.restype = ctypes.c_int32
+    actual = int(abi_fn())
+    if actual != RUNTIME_ABI_VERSION:
+        raise CompileError(
+            f"runtime-backed kernel ABI mismatch: expected {RUNTIME_ABI_VERSION}, "
+            f"loaded {actual} for {so_path!r}"
+        )
 
 
 class CompiledKernel:
@@ -161,14 +144,15 @@ class CompiledKernel:
         self.ret_nbytes = [w // 8 for w in mod.ret_bits]
 
         self._lib = ctypes.CDLL(so_path)
+        if mod.requires_runtime:
+            _validate_linked_runtime(self._lib, so_path)
         self._fn = getattr(self._lib, f"{mod.name}_abi")
         self._fn.restype = None
         self._fn.argtypes = [ctypes.c_void_p] * (self.nouts + self.nargs)
         self._batch = getattr(self._lib, f"{mod.name}_batch")
         self._batch.restype = None
-        self._batch.argtypes = (
-            [ctypes.c_size_t]
-            + [ctypes.c_void_p] * (self.nouts + self.nargs)
+        self._batch.argtypes = [ctypes.c_size_t] + [ctypes.c_void_p] * (
+            self.nouts + self.nargs
         )
 
     def __call__(self, arg_ints: List[int]):
@@ -187,21 +171,92 @@ class CompiledKernel:
         vals = tuple(int.from_bytes(o.raw, "little") for o in outs)
         return vals[0] if self.nouts == 1 else vals
 
-    def map_raw(self, n: int, out_addresses: List[int],
-                arg_addresses: List[int]) -> None:
+    def map_raw(
+        self, n: int, out_addresses: List[int], arg_addresses: List[int]
+    ) -> None:
         """Run the batch loop over raw contiguous limb buffers (zero-copy)."""
         self._batch(n, *out_addresses, *arg_addresses)
 
 
-def compile_module(mod: GeneratedModule, *, montgomery: bool = True,
-                   opt: str = "-O2") -> CompiledKernel:
-    # abi=3: multi-output struct-return wrappers (outs-first pointer order)
-    key_src = mod.text + f"|mont={montgomery}|opt={opt}|abi=3"
+class CompiledRawFunction:
+    """Loaded pointer-only entry from a structured MLIR module."""
+
+    def __init__(self, so_path: str, mod: RawPointerModule):
+        self.nargs = mod.nargs
+        self._lib = ctypes.CDLL(so_path)
+        if mod.requires_runtime:
+            _validate_linked_runtime(self._lib, so_path)
+        self._fn = getattr(self._lib, mod.name)
+        self._fn.restype = None
+        self._fn.argtypes = [ctypes.c_void_p] * mod.nargs
+
+    def __call__(self, addresses: List[int]) -> None:
+        if len(addresses) != self.nargs:
+            raise TypeError(
+                f"raw entry requires {self.nargs} pointers, got {len(addresses)}"
+            )
+        self._fn(*addresses)
+
+
+def _compile_shared(
+    mod,
+    *,
+    montgomery: bool,
+    inv: str,
+    limb_specialization: str,
+    opt: str,
+    llvm_suffix: str,
+    abi_tag: str,
+) -> str:
+    """Compile a generated module and return its cached shared-object path."""
+    if inv not in ("fermat", "runtime"):
+        raise ValueError("inv must be 'fermat' or 'runtime'")
+    if limb_specialization not in ("generic", "auto", "compact"):
+        raise ValueError("limb_specialization must be 'generic', 'auto', or 'compact'")
+    requires_runtime = mod.requires_runtime or inv == "runtime"
+    runtime_path = None
+    if requires_runtime:
+        runtime_path = find_runtime()
+        if runtime_path is None:
+            raise CompileError(
+                "module requires libff_rt, but the runtime was not found; "
+                "build it with `make runtime` or set FFJIT_RUNTIME"
+            )
+        try:
+            Runtime(runtime_path)
+        except RuntimeError as exc:
+            raise CompileError(f"module requires a compatible libff_rt: {exc}") from exc
+        runtime_file = Path(runtime_path)
+        if not runtime_file.is_file():
+            raise CompileError(
+                "runtime discovery did not return an absolute library path; "
+                "set FFJIT_RUNTIME to the runtime file or directory"
+            )
+        runtime_file = runtime_file.resolve()
+        runtime_stat = runtime_file.stat()
+
+    key_src = (
+        mod.text
+        + f"|mont={montgomery}|inv={inv}|limbs={limb_specialization}|opt={opt}"
+        + f"|kernel_abi={KERNEL_ABI_VERSION}"
+        + f"|raw_abi={RAW_ABI_VERSION}"
+        + f"|entry_abi={abi_tag}"
+        + f"|runtime_abi={RUNTIME_ABI_VERSION}"
+        + f"|requires_runtime={requires_runtime}"
+        + (
+            f"|runtime_path={runtime_file}"
+            f"|runtime_size={runtime_stat.st_size}"
+            f"|runtime_mtime={runtime_stat.st_mtime_ns}"
+            if runtime_path is not None
+            else ""
+        )
+        + llvm_suffix
+    )
     key = hashlib.sha256(key_src.encode()).hexdigest()[:16]
     cache = _cache_dir()
     so_path = cache / f"{mod.name}_{key}.so"
     if so_path.exists():
-        return CompiledKernel(str(so_path), mod)
+        return str(so_path)
 
     # Serialize concurrent builds of the same kernel across processes; the
     # .so appears in the cache atomically (build to temp name, then rename).
@@ -209,7 +264,7 @@ def compile_module(mod: GeneratedModule, *, montgomery: bool = True,
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         if so_path.exists():  # another process built it while we waited
-            return CompiledKernel(str(so_path), mod)
+            return str(so_path)
 
         ffc = _find_ffc()
         clang = _find_clang()
@@ -224,22 +279,82 @@ def compile_module(mod: GeneratedModule, *, montgomery: bool = True,
             cmd = [ffc, str(mlir_path), "-o", str(ll_path), "--emit=llvm"]
             if not montgomery:
                 cmd.append("--no-montgomery")
+            if inv != "fermat":
+                cmd.append(f"--inv={inv}")
+            cmd.append(f"--limb-specialization={limb_specialization}")
             _run(cmd, "MLIR-to-LLVM lowering")
 
             with open(ll_path, "a") as f:
                 f.write("\n")
-                f.write(_abi_wrapper(mod))
-                f.write("\n")
-                f.write(_batch_wrapper(mod))
+                f.write(llvm_suffix)
 
             try:
+                link_args = []
+                if runtime_path is not None:
+                    link_args.append(str(runtime_file))
+                    link_args.append(f"-Wl,-rpath,{runtime_file.parent}")
                 _run(
-                    [clang, "-shared", "-fPIC", opt,
-                     "-o", str(tmp_so), str(ll_path)],
+                    [
+                        clang,
+                        "-shared",
+                        "-fPIC",
+                        opt,
+                        "-o",
+                        str(tmp_so),
+                        str(ll_path),
+                        *link_args,
+                    ],
                     "native code generation",
                 )
                 os.replace(tmp_so, so_path)
             finally:
                 tmp_so.unlink(missing_ok=True)
 
-    return CompiledKernel(str(so_path), mod)
+    return str(so_path)
+
+
+def compile_module(
+    mod: GeneratedModule,
+    *,
+    montgomery: bool = True,
+    inv: str = "fermat",
+    limb_specialization: str = "auto",
+    opt: str = "-O2",
+) -> CompiledKernel:
+    so_path = _compile_shared(
+        mod,
+        montgomery=montgomery,
+        inv=inv,
+        limb_specialization=limb_specialization,
+        opt=opt,
+        llvm_suffix=_abi_wrapper(mod),
+        abi_tag="kernel",
+    )
+    kernel = CompiledKernel(so_path, mod)
+    if inv == "runtime" and not mod.requires_runtime:
+        _validate_linked_runtime(kernel._lib, so_path)
+    return kernel
+
+
+def compile_raw_module(
+    mod: RawPointerModule,
+    *,
+    montgomery: bool = True,
+    inv: str = "fermat",
+    limb_specialization: str = "auto",
+    opt: str = "-O2",
+) -> CompiledRawFunction:
+    """Compile and bind a structured pointer-only exported function."""
+    so_path = _compile_shared(
+        mod,
+        montgomery=montgomery,
+        inv=inv,
+        limb_specialization=limb_specialization,
+        opt=opt,
+        llvm_suffix="",
+        abi_tag="raw",
+    )
+    function = CompiledRawFunction(so_path, mod)
+    if inv == "runtime" and not mod.requires_runtime:
+        _validate_linked_runtime(function._lib, so_path)
+    return function

@@ -8,6 +8,8 @@
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/PatternMatch.h"
 
+#include <limits>
+
 using namespace mlir;
 using namespace ffjit::field;
 
@@ -19,9 +21,9 @@ using namespace ffjit::field;
 //
 // Field values are opaque SSA values, but `from_int(arith.constant c)` is a
 // recognizable literal with known value c mod p. That is enough to implement
-// the useful algebraic identities: x+0, x-0, x*1, x*0, x-x, -(-x), and
-// inv(inv(x)) (valid at 0 too, by the inv(0) = 0 convention), plus constant
-// folding of add/sub/mul/neg over literals. Combined with DCE of the Pure
+// the useful algebraic identities: x+0, x+(-x), x-0, 0-x, x*1, x*0, x-x,
+// -(-x), inv(inv(x)), and powers by zero/one, plus constant folding over
+// literals. Combined with DCE of the Pure
 // ops, mul-by-zero folding erases entire dead term chains -- e.g. the
 // `a * Z^4` term of a generic Weierstrass doubling formula when a = 0.
 //===----------------------------------------------------------------------===//
@@ -74,6 +76,16 @@ struct AddCanon : OpRewritePattern<AddOp> {
       rewriter.replaceOp(op, op.getRhs());
       return success();
     }
+    // x + (-x) -> 0 (and mirrored).
+    auto rhsNeg = op.getRhs().getDefiningOp<NegOp>();
+    auto lhsNeg = op.getLhs().getDefiningOp<NegOp>();
+    if ((rhsNeg && rhsNeg.getOperand() == op.getLhs()) ||
+        (lhsNeg && lhsNeg.getOperand() == op.getRhs())) {
+      rewriter.replaceOp(op, makeLiteral(rewriter, op.getLoc(),
+                                         cast<ElementType>(op.getType()),
+                                         APInt::getZero(1)));
+      return success();
+    }
     // literal + literal -> literal
     if (lConst && rConst) {
       unsigned w = std::max(l.getBitWidth(), r.getBitWidth()) + 1;
@@ -104,6 +116,11 @@ struct SubCanon : OpRewritePattern<SubOp> {
     // x - 0 -> x
     if (rConst && r.isZero()) {
       rewriter.replaceOp(op, op.getLhs());
+      return success();
+    }
+    // 0 - x -> -x.
+    if (lConst && l.isZero()) {
+      rewriter.replaceOpWithNewOp<NegOp>(op, op.getRhs());
       return success();
     }
     // literal - literal -> literal
@@ -193,6 +210,53 @@ struct InvCanon : OpRewritePattern<InvOp> {
       rewriter.replaceOp(op, inner.getOperand());
       return success();
     }
+    // inv(0) -> 0 and inv(1) -> 1.
+    APInt c;
+    if (matchLiteral(op.getOperand(), c) && (c.isZero() || c.isOne())) {
+      rewriter.replaceOp(op, op.getOperand());
+      return success();
+    }
+    return failure();
+  }
+};
+
+struct PowCanon : OpRewritePattern<PowOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(PowOp op,
+                                PatternRewriter &rewriter) const override {
+    uint64_t exponent = op.getExponent();
+    auto elem = cast<ElementType>(op.getType());
+    if (exponent == 0) {
+      rewriter.replaceOp(op,
+                         makeLiteral(rewriter, op.getLoc(), elem, APInt(1, 1)));
+      return success();
+    }
+    if (exponent == 1) {
+      rewriter.replaceOp(op, op.getBase());
+      return success();
+    }
+
+    APInt c;
+    if (matchLiteral(op.getBase(), c)) {
+      APInt p = elem.getModulusValue();
+      unsigned width = p.getBitWidth();
+      APInt base = c.zextOrTrunc(width);
+      APInt result(width, 1);
+      uint64_t e = exponent;
+      while (e != 0) {
+        if (e & 1)
+          result = (result.zext(2 * width) * base.zext(2 * width))
+                       .urem(p.zext(2 * width))
+                       .trunc(width);
+        e >>= 1;
+        if (e != 0)
+          base = (base.zext(2 * width) * base.zext(2 * width))
+                     .urem(p.zext(2 * width))
+                     .trunc(width);
+      }
+      rewriter.replaceOp(op, makeLiteral(rewriter, op.getLoc(), elem, result));
+      return success();
+    }
     return failure();
   }
 };
@@ -222,4 +286,16 @@ void NegOp::getCanonicalizationPatterns(RewritePatternSet &results,
 void InvOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InvCanon>(context);
+}
+
+LogicalResult PowOp::verify() {
+  if (getExponent() >
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    return emitOpError("requires an exponent in the range [0, 2^63-1]");
+  return success();
+}
+
+void PowOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                        MLIRContext *context) {
+  results.add<PowCanon>(context);
 }

@@ -53,10 +53,25 @@ def Field_InvOp : Field_UnaryOp<"inv"> {
   let hasCanonicalizer = 1;
   let description = [{
     Computes the multiplicative inverse in GF(p). By convention `inv(0) = 0`.
-    Lowered to a call into the C ABI runtime (`ff_rt_inv`, binary extended
-    Euclid) so the IR stays small; a pure-IR Fermat exponentiation lowering
-    is a future alternative.
+    The default lowering is a self-contained pure-IR Fermat exponentiation.
+    An optional lowering calls the versioned C ABI runtime.
   }];
+}
+
+def Field_PowOp : Field_Op<"pow", [Pure, SameOperandsAndResultType]> {
+  let summary = "Raise a field element to a bounded constant exponent.";
+  let description = [{
+    Computes `base^exponent` in GF(p), where `exponent` is a non-negative
+    compile-time integer in the signed 64-bit range. Lowering emits a compact
+    square-and-multiply loop rather than expanding the exponentiation in the
+    traced graph.
+  }];
+  let arguments = (ins Field_ElementType:$base, I64Attr:$exponent);
+  let results = (outs Field_ElementType:$result);
+  let assemblyFormat =
+      "$base `,` $exponent attr-dict `:` type($result)";
+  let hasVerifier = 1;
+  let hasCanonicalizer = 1;
 }
 
 //===----------------------------------------------------------------------===//

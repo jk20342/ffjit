@@ -17,21 +17,55 @@ MapResult = Union[FieldArray, tuple]
 
 
 class JittedFunction:
-    def __init__(self, fn: Callable, *, montgomery: bool = True, opt: str = "-O2"):
+    def __init__(
+        self,
+        fn: Callable,
+        *,
+        montgomery: bool = True,
+        inv: str = "fermat",
+        limb_specialization: str = "auto",
+        opt: str = "-O2",
+    ):
+        if inv not in ("fermat", "runtime"):
+            raise ValueError("inv must be 'fermat' or 'runtime'")
+        if limb_specialization not in ("generic", "auto", "compact"):
+            raise ValueError(
+                "limb_specialization must be 'generic', 'auto', or 'compact'"
+            )
         self._fn = fn
         self._name = "ff_" + fn.__name__
         self._montgomery = montgomery
+        self._inv = inv
+        self._limb_specialization = limb_specialization
         self._opt = opt
-        self._cache = {}  # (moduli tuple) -> (CompiledKernel, result_field)
+        self._cache = {}
         functools.update_wrapper(self, fn)
 
     def _specialize(self, fields):
-        key = tuple(f.modulus for f in fields)
+        key = (
+            tuple(f.modulus for f in fields),
+            self._montgomery,
+            self._inv,
+            self._limb_specialization,
+            self._opt,
+        )
         if key in self._cache:
             return self._cache[key]
         ctx, inputs, outputs = trace(self._fn, fields)
-        mod = generate(self._name, ctx, inputs, outputs)
-        kernel = compile_module(mod, montgomery=self._montgomery, opt=self._opt)
+        mod = generate(
+            self._name,
+            ctx,
+            inputs,
+            outputs,
+            requires_runtime=self._inv == "runtime",
+        )
+        kernel = compile_module(
+            mod,
+            montgomery=self._montgomery,
+            inv=self._inv,
+            limb_specialization=self._limb_specialization,
+            opt=self._opt,
+        )
         result_fields = [o.field for o in outputs]
         entry = (kernel, result_fields)
         self._cache[key] = entry
@@ -87,17 +121,14 @@ class JittedFunction:
         fields = [fa.field for fa in fas]
         kernel, result_fields = self._specialize(fields)
 
-        outs = [
-            ctypes.create_string_buffer(n * nb) for nb in kernel.ret_nbytes
-        ]
+        outs = [ctypes.create_string_buffer(n * nb) for nb in kernel.ret_nbytes]
         kernel.map_raw(
             n,
             [ctypes.addressof(o) for o in outs],
             [fa.buffer_address() for fa in fas],
         )
         results = tuple(
-            FieldArray._from_raw(f, o.raw, n)
-            for f, o in zip(result_fields, outs)
+            FieldArray._from_raw(f, o.raw, n) for f, o in zip(result_fields, outs)
         )
         return results[0] if len(results) == 1 else results
 
@@ -107,7 +138,14 @@ class JittedFunction:
         return generate(self._name, ctx, inputs, outputs).text
 
 
-def jit(fn=None, *, montgomery: bool = True, opt: str = "-O2"):
+def jit(
+    fn=None,
+    *,
+    montgomery: bool = True,
+    inv: str = "fermat",
+    limb_specialization: str = "auto",
+    opt: str = "-O2",
+):
     """Decorate a straight-line field function for JIT compilation.
 
     Usage::
@@ -119,11 +157,27 @@ def jit(fn=None, *, montgomery: bool = True, opt: str = "-O2"):
             return (x * y + x).inv()
 
         f(F(3), F(5))   # -> GF(p) element
+
+    ``limb_specialization="compact"`` opts into narrower Montgomery
+    intermediates for supported storage widths. ``"auto"`` currently keeps
+    the generic lowering because benchmarks did not show a consistent win.
     """
     if fn is not None:
-        return JittedFunction(fn, montgomery=montgomery, opt=opt)
+        return JittedFunction(
+            fn,
+            montgomery=montgomery,
+            inv=inv,
+            limb_specialization=limb_specialization,
+            opt=opt,
+        )
 
     def deco(f):
-        return JittedFunction(f, montgomery=montgomery, opt=opt)
+        return JittedFunction(
+            f,
+            montgomery=montgomery,
+            inv=inv,
+            limb_specialization=limb_specialization,
+            opt=opt,
+        )
 
     return deco

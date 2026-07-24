@@ -16,5 +16,6 @@ add_mlir_dialect_library(FFJITFieldTransforms
   MLIRArithDialect
   MLIRFuncDialect
   MLIRFuncTransforms
+  MLIRLLVMDialect
   MLIRSCFDialect
   )

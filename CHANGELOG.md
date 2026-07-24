@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+Native orchestration and compiler maturity.
+
+- Batch wrappers are structured MLIR `scf.for` loops over the existing raw
+  pointer ABI instead of LLVM text appended by the Python compiler.
+- Forward and inverse NTT, cyclic polynomial multiplication, and negacyclic
+  multiplication have one-call structured native drivers with reference
+  fallbacks.
+- Batch inversion is a generated one-call MLIR kernel. Runtime ABI v3 moves
+  MSM and fixed-base digit, bucket, reduction, and window scheduling out of
+  Python while retaining generated field kernels and exceptional-case checks.
+- `field.pow` keeps compile-time integer powers compact and lowers them to a
+  bounded loop. Field lowering now runs CSE and includes additional algebraic
+  canonicalizations.
+- `field.inv` can use the default Fermat loop or the C runtime XGCD path with
+  explicit Montgomery-domain boundary conversions.
+- Added guarded `generic`, `auto`, and `compact` Montgomery-width modes.
+  `auto` remains generic because compact results are workload-dependent.
+- Runtime and generated-kernel ABI versions now participate in cache keys and
+  runtime-required kernels validate and link the matching `libff_rt`.
+
 ## 0.2.0
 
 Performance and algorithmic depth.
@@ -11,7 +33,7 @@ Performance and algorithmic depth.
   (63 ms at n=512).
 - Fixed-base comb precomputation (`Point.precompute()`): table-backed
   scalar multiplication with zero doublings, 5.8x over GLV double-and-add.
-- BLS12-381 G1 preset (`ff.bls12_381_g1()`), exercising the 7-limb
+- BLS12-381 G1 preset (`ff.bls12_381_g1()`), exercising the 6-limb
   (381-bit) code path end to end; GLV-enabled.
 - Negacyclic convolution `ff.negacyclic_mul` in GF(p)[x]/(x^n + 1) via
   psi-twisting (the Ring-LWE ring).

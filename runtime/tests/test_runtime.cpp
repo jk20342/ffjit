@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -158,15 +159,72 @@ void testZeroConvention() {
     assert(out[i] == 0 && "inv(0) must be 0 (4 limbs)");
 }
 
+uint64_t runSchedule(const ff_rt_point_schedule &schedule,
+                     const std::vector<ff_rt_point_op> &ops,
+                     const std::vector<uint64_t> &inputs) {
+  assert(schedule.version == FF_RT_MSM_SCHEDULE_VERSION);
+  assert(inputs.size() == schedule.input_count);
+  std::vector<uint64_t> slots(schedule.slot_count, 0);
+  std::memcpy(slots.data(), inputs.data(), inputs.size() * sizeof(uint64_t));
+  for (const ff_rt_point_op &op : ops) {
+    assert(op.lhs < op.out && op.out < schedule.slot_count);
+    if (op.kind == FF_RT_POINT_ADD)
+      slots[op.out] = slots[op.lhs] + slots[op.rhs];
+    else {
+      assert(op.kind == FF_RT_POINT_DOUBLE);
+      slots[op.out] = 2 * slots[op.lhs];
+    }
+  }
+  return schedule.result_slot == UINT64_MAX ? 0 : slots[schedule.result_slot];
+}
+
+void testMsmSchedule() {
+  const uint64_t scalars[] = {3, 5, 0};
+  ff_rt_point_schedule schedule{};
+  assert(ff_rt_msm_schedule(scalars, 3, 1, 4, 2, &schedule, nullptr, 0) == 0);
+  std::vector<ff_rt_point_op> ops(schedule.op_count);
+  assert(ff_rt_msm_schedule(scalars, 3, 1, 4, 2, &schedule, ops.data(),
+                            ops.size()) == 0);
+  assert(runSchedule(schedule, ops, {1, 2, 3}) == 13);
+
+  ff_rt_point_op shortBuffer{};
+  assert(ff_rt_msm_schedule(scalars, 3, 1, 4, 2, &schedule, &shortBuffer, 1) ==
+         -2);
+}
+
+void testFixedBaseSchedule() {
+  const uint64_t scalar = 13;
+  ff_rt_point_schedule schedule{};
+  assert(ff_rt_fixed_base_schedule(&scalar, 1, 4, 2, 2, &schedule, nullptr,
+                                   0) == 0);
+  std::vector<ff_rt_point_op> ops(schedule.op_count);
+  assert(ff_rt_fixed_base_schedule(&scalar, 1, 4, 2, 2, &schedule, ops.data(),
+                                   ops.size()) == 0);
+  std::vector<uint64_t> table = {1, 2, 3, 4, 8, 12};
+  assert(runSchedule(schedule, ops, table) == scalar);
+}
+
+void testNonInvertibleCompositeInput() {
+  const uint64_t modulus = 15;
+  const uint64_t value = 3;
+  uint64_t out = ~0ULL;
+  ff_rt_inv(&out, &value, &modulus, 1);
+  assert(out == 0 && "non-invertible input must return zero");
+}
+
 } // namespace
 
 int main() {
-  assert(ff_rt_abi_version() == 1);
+  static_assert(FF_RT_ABI_VERSION == 3, "unexpected compile-time runtime ABI");
+  assert(ff_rt_abi_version() == FF_RT_ABI_VERSION);
 
   testSingleLimbPrime(65537);                  // Fermat prime F4
   testSingleLimbPrime(2305843009213693951ULL); // Mersenne prime 2^61 - 1
   testBN254();
   testZeroConvention();
+  testNonInvertibleCompositeInput();
+  testMsmSchedule();
+  testFixedBaseSchedule();
 
   std::printf("ALL RUNTIME TESTS PASSED\n");
   return 0;

@@ -7,6 +7,8 @@
 //
 // Usage:
 //   ffc input.mlir -o out.ll [--emit=llvm|mlir] [--no-montgomery]
+//       [--inv=fermat|runtime]
+//       [--limb-specialization=generic|auto|compact]
 //
 //===----------------------------------------------------------------------===//
 
@@ -37,6 +39,8 @@ using namespace mlir;
 
 int main(int argc, char **argv) {
   std::string inputFile, outputFile = "-", emit = "llvm";
+  std::string invMethod = "fermat";
+  std::string limbSpecialization = "auto";
   bool montgomery = true;
 
   for (int i = 1; i < argc; ++i) {
@@ -47,9 +51,25 @@ int main(int argc, char **argv) {
       emit = a.substr(7);
     } else if (a == "--no-montgomery") {
       montgomery = false;
+    } else if (a.rfind("--inv=", 0) == 0) {
+      invMethod = a.substr(6);
+      if (invMethod != "fermat" && invMethod != "runtime") {
+        llvm::errs() << "ffc: --inv must be 'fermat' or 'runtime'\n";
+        return 1;
+      }
+    } else if (a.rfind("--limb-specialization=", 0) == 0) {
+      limbSpecialization = a.substr(22);
+      if (limbSpecialization != "generic" && limbSpecialization != "auto" &&
+          limbSpecialization != "compact") {
+        llvm::errs() << "ffc: --limb-specialization must be 'generic', "
+                        "'auto', or 'compact'\n";
+        return 1;
+      }
     } else if (a == "-h" || a == "--help") {
       llvm::errs() << "usage: ffc input.mlir -o out.ll "
-                      "[--emit=llvm|mlir] [--no-montgomery]\n";
+                      "[--emit=llvm|mlir] [--no-montgomery] "
+                      "[--inv=fermat|runtime] "
+                      "[--limb-specialization=generic|auto|compact]\n";
       return 0;
     } else if (a[0] != '-') {
       inputFile = a;
@@ -87,7 +107,8 @@ int main(int argc, char **argv) {
   // wide-integer Montgomery arithmetic.
   std::string pipeline =
       "canonicalize,convert-field-to-arith{montgomery=" + montStr +
-      "},convert-scf-to-cf,convert-arith-to-llvm,"
+      " inv=" + invMethod + " limb-specialization=" + limbSpecialization +
+      "},cse,convert-scf-to-cf,convert-arith-to-llvm,"
       "convert-cf-to-llvm,convert-func-to-llvm,"
       "reconcile-unrealized-casts";
 

@@ -125,3 +125,30 @@ def test_division_operator():
     x, y = 100, 7
     got = int(d(F(x), F(y)))
     assert (got * y) % p == x % p
+
+
+@pytest.mark.parametrize("exponent", [0, 1, 2, 5, 1234567])
+def test_bounded_power(exponent):
+    p = PRIMES["bn254"]
+    F = ff.GF(p)
+
+    @ff.jit
+    def power(x):
+        return x**exponent
+
+    assert int(power(F(123456789))) == pow(123456789, exponent, p)
+    text = power.mlir(F)
+    assert text.count("field.pow") == 1
+    assert "field.mul" not in text
+
+
+@pytest.mark.parametrize("exponent", [-1, 1 << 63])
+def test_power_rejects_out_of_range_exponents(exponent):
+    F = ff.GF(PRIMES["gf17bit"])
+
+    @ff.jit
+    def power(x):
+        return x**exponent
+
+    with pytest.raises(ff.TraceError, match="exponent"):
+        power(F(2))

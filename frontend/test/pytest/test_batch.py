@@ -31,6 +31,46 @@ def k_invmul(a, b):
     return (a * b).inv()
 
 
+@ff.jit
+def k_pair(a, b):
+    return a, b
+
+
+def test_batch_wrapper_is_structured_mlir():
+    F = ff.GF(P_SMALL)
+    text = k_mul.mlir(F, F)
+
+    assert "func.func @ff_k_mul_batch(" in text
+    assert "scf.for" in text
+    assert "llvm.getelementptr" in text
+    assert "!llvm.ptr" in text
+    assert "memref" not in text
+
+
+def test_batch_zero_length_single_and_multiple_outputs():
+    F = ff.GF(P_SMALL)
+    empty = ff.FieldArray(F, [])
+
+    single = k_mul.map(empty, empty)
+    left, right = k_pair.map(empty, empty)
+
+    assert single.to_ints() == []
+    assert left.to_ints() == []
+    assert right.to_ints() == []
+
+
+def test_batch_multiple_outputs_with_differing_widths():
+    F64 = ff.GF(P_SMALL)
+    F256 = ff.GF(P_BN254)
+    small = ff.FieldArray(F64, [0, 1, P_SMALL - 1])
+    wide = ff.FieldArray(F256, [2, 3, P_BN254 - 1])
+
+    small_out, wide_out = k_pair.map(small, wide)
+
+    assert small_out.to_ints() == small.to_ints()
+    assert wide_out.to_ints() == wide.to_ints()
+
+
 @pytest.mark.parametrize("p", PRIMES)
 def test_batch_mul_matches_reference(p):
     F = ff.GF(p)

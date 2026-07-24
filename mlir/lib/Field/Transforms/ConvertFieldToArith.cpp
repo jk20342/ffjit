@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/APInt.h"
@@ -44,7 +45,7 @@ namespace {
 /// representatives in [0, p); intermediate products use a wide type.
 struct FieldLowering {
   unsigned W;    // storage bit width = 64 * nlimbs, R = 2^W > p
-  unsigned Wbig; // wide width for products/REDC (2W + 64, no overflow)
+  unsigned Wbig; // generic 2W + 64, or compact 2W + 1
   APInt p;       // modulus, width W
   APInt pInv;    // (-p^{-1}) mod 2^W, width W
   APInt R2;      // 2^(2W) mod p, width W (value < p)
@@ -53,14 +54,22 @@ struct FieldLowering {
   Type ti;   // IntegerType(W)
   Type tbig; // IntegerType(Wbig)
 
-  FieldLowering(ElementType elem, bool mont, MLIRContext *ctx) {
+  FieldLowering(ElementType elem, bool mont, bool requestCompact,
+                MLIRContext *ctx) {
     montgomery = mont;
     W = elem.getStorageBitWidth();
-    Wbig = 2 * W + 64;
+    p = elem.getModulusValue().zextOrTrunc(W);
+
+    // T + m*p is less than 2*R*p, hence less than 2^(2W+1). Restrict this
+    // compact representation to benchmark candidates with the Montgomery
+    // preconditions checked from the type itself.
+    bool supportedWidth = W == 256 || W == 384 || W == 448;
+    bool validModulus = !p.isZero() && p[0] && p.getActiveBits() < W;
+    bool compact =
+        montgomery && requestCompact && supportedWidth && validModulus;
+    Wbig = compact ? 2 * W + 1 : 2 * W + 64;
     ti = IntegerType::get(ctx, W);
     tbig = IntegerType::get(ctx, Wbig);
-
-    p = elem.getModulusValue().zextOrTrunc(W);
 
     // -- p^{-1} mod 2^W via Newton/Hensel lifting (doubles correct bits each
     //    step; starts exact to 1 bit because p is odd). All arithmetic is
@@ -199,17 +208,14 @@ struct FieldLowering {
     return redc(b, loc, aB);
   }
 
-  /// Multiplicative inverse via Fermat's little theorem: a^(p-2).
-  /// The exponent e = p-2 is a compile-time constant, but rather than unroll
-  /// the ladder (which produces enormous IR and slow back-end compiles) we
-  /// emit a compact `scf.for` running a left-to-right Montgomery
-  /// square-and-multiply. The multiply is predicated with `select` so the
-  /// loop body is branch-free. `inv(0)=0` falls out naturally.
-  Value inv(OpBuilder &b, Location loc, Value a) const {
-    APInt e = p - APInt(W, 2);
+  /// Raise a value to a non-negative compile-time exponent. Rather than
+  /// unroll the ladder, emit a compact left-to-right square-and-multiply
+  /// `scf.for`. The multiply is predicated so the body is branch-free.
+  Value pow(OpBuilder &b, Location loc, Value a, const APInt &exponent) const {
+    APInt e = exponent.zextOrTrunc(std::max(W, exponent.getBitWidth()));
     unsigned nbits = std::max(1u, e.getActiveBits());
     Value one = montgomery ? montOne(b, loc) : cstTi(b, loc, APInt(W, 1));
-    Value eC = cstTi(b, loc, e);
+    Value eC = cstTi(b, loc, e.zextOrTrunc(W));
 
     Value lb = b.create<arith::ConstantIndexOp>(loc, 0);
     Value ub = b.create<arith::ConstantIndexOp>(loc, nbits);
@@ -231,6 +237,31 @@ struct FieldLowering {
           bb.create<scf::YieldOp>(l, next);
         });
     return loop.getResult(0);
+  }
+
+  /// Multiplicative inverse via Fermat's little theorem: a^(p-2).
+  Value inv(OpBuilder &b, Location loc, Value a) const {
+    return pow(b, loc, a, p - APInt(W, 2));
+  }
+
+  /// Call the pointer-based C runtime on a canonical representative. The
+  /// temporary wide integers have the runtime's little-endian limb layout on
+  /// supported little-endian targets.
+  Value runtimeInv(OpBuilder &b, Location loc, Value a) const {
+    Value canonical = fromMont(b, loc, a);
+    Value modulus = cstTi(b, loc, p);
+    Value one = b.create<arith::ConstantIntOp>(loc, 1, 64);
+    Type ptrTy = LLVM::LLVMPointerType::get(b.getContext());
+    Value outPtr = b.create<LLVM::AllocaOp>(loc, ptrTy, ti, one, 8);
+    Value inPtr = b.create<LLVM::AllocaOp>(loc, ptrTy, ti, one, 8);
+    Value modPtr = b.create<LLVM::AllocaOp>(loc, ptrTy, ti, one, 8);
+    b.create<LLVM::StoreOp>(loc, canonical, inPtr, 8);
+    b.create<LLVM::StoreOp>(loc, modulus, modPtr, 8);
+    Value limbs = b.create<arith::ConstantIntOp>(loc, W / 64, 64);
+    b.create<LLVM::CallOp>(loc, TypeRange{}, "ff_rt_inv",
+                           ValueRange{outPtr, inPtr, modPtr, limbs});
+    Value result = b.create<LLVM::LoadOp>(loc, ti, outPtr, 8);
+    return toMont(b, loc, result);
   }
 
   /// from_int: reduce an arbitrary-width unsigned integer into the domain.
@@ -259,8 +290,8 @@ struct FieldLowering {
 //===----------------------------------------------------------------------===//
 
 /// Build a FieldLowering for the element type of a field op result/operand.
-static FieldLowering makeLowering(ElementType elem, bool mont) {
-  return FieldLowering(elem, mont, elem.getContext());
+static FieldLowering makeLowering(ElementType elem, bool mont, bool compact) {
+  return FieldLowering(elem, mont, compact, elem.getContext());
 }
 
 struct FieldTypeConverter : public TypeConverter {
@@ -273,9 +304,13 @@ struct FieldTypeConverter : public TypeConverter {
 };
 
 template <typename OpT> struct FieldOpPattern : OpConversionPattern<OpT> {
-  FieldOpPattern(const TypeConverter &tc, MLIRContext *ctx, bool mont)
-      : OpConversionPattern<OpT>(tc, ctx), montgomery(mont) {}
+  FieldOpPattern(const TypeConverter &tc, MLIRContext *ctx, bool mont,
+                 bool runtime, bool compact)
+      : OpConversionPattern<OpT>(tc, ctx), montgomery(mont),
+        runtimeInv(runtime), compactIntermediates(compact) {}
   bool montgomery;
+  bool runtimeInv;
+  bool compactIntermediates;
 };
 
 struct AddLowering : FieldOpPattern<AddOp> {
@@ -284,7 +319,7 @@ struct AddLowering : FieldOpPattern<AddOp> {
   matchAndRewrite(AddOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getResult().getType());
-    auto fl = makeLowering(elem, montgomery);
+    auto fl = makeLowering(elem, montgomery, compactIntermediates);
     rewriter.replaceOp(
         op, fl.add(rewriter, op.getLoc(), adaptor.getLhs(), adaptor.getRhs()));
     return success();
@@ -297,7 +332,7 @@ struct SubLowering : FieldOpPattern<SubOp> {
   matchAndRewrite(SubOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getResult().getType());
-    auto fl = makeLowering(elem, montgomery);
+    auto fl = makeLowering(elem, montgomery, compactIntermediates);
     rewriter.replaceOp(
         op, fl.sub(rewriter, op.getLoc(), adaptor.getLhs(), adaptor.getRhs()));
     return success();
@@ -310,7 +345,7 @@ struct MulLowering : FieldOpPattern<MulOp> {
   matchAndRewrite(MulOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getResult().getType());
-    auto fl = makeLowering(elem, montgomery);
+    auto fl = makeLowering(elem, montgomery, compactIntermediates);
     rewriter.replaceOp(
         op, fl.mul(rewriter, op.getLoc(), adaptor.getLhs(), adaptor.getRhs()));
     return success();
@@ -323,7 +358,7 @@ struct NegLowering : FieldOpPattern<NegOp> {
   matchAndRewrite(NegOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getResult().getType());
-    auto fl = makeLowering(elem, montgomery);
+    auto fl = makeLowering(elem, montgomery, compactIntermediates);
     rewriter.replaceOp(op, fl.neg(rewriter, op.getLoc(), adaptor.getOperand()));
     return success();
   }
@@ -335,8 +370,28 @@ struct InvLowering : FieldOpPattern<InvOp> {
   matchAndRewrite(InvOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getResult().getType());
-    auto fl = makeLowering(elem, montgomery);
-    rewriter.replaceOp(op, fl.inv(rewriter, op.getLoc(), adaptor.getOperand()));
+    auto fl = makeLowering(elem, montgomery, compactIntermediates);
+    if (runtimeInv && fl.W / 64 > 8)
+      return op.emitOpError(
+          "runtime inversion supports at most 8 64-bit limbs");
+    Value result =
+        runtimeInv ? fl.runtimeInv(rewriter, op.getLoc(), adaptor.getOperand())
+                   : fl.inv(rewriter, op.getLoc(), adaptor.getOperand());
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+struct PowLowering : FieldOpPattern<PowOp> {
+  using FieldOpPattern::FieldOpPattern;
+  LogicalResult
+  matchAndRewrite(PowOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto elem = cast<ElementType>(op.getResult().getType());
+    auto fl = makeLowering(elem, montgomery, compactIntermediates);
+    APInt exponent(64, static_cast<uint64_t>(op.getExponent()));
+    rewriter.replaceOp(
+        op, fl.pow(rewriter, op.getLoc(), adaptor.getBase(), exponent));
     return success();
   }
 };
@@ -347,7 +402,7 @@ struct FromIntLowering : FieldOpPattern<FromIntOp> {
   matchAndRewrite(FromIntOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getResult().getType());
-    auto fl = makeLowering(elem, montgomery);
+    auto fl = makeLowering(elem, montgomery, compactIntermediates);
     rewriter.replaceOp(op,
                        fl.fromInt(rewriter, op.getLoc(), adaptor.getInput()));
     return success();
@@ -360,7 +415,7 @@ struct ToIntLowering : FieldOpPattern<ToIntOp> {
   matchAndRewrite(ToIntOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getInput().getType());
-    auto fl = makeLowering(elem, montgomery);
+    auto fl = makeLowering(elem, montgomery, compactIntermediates);
     rewriter.replaceOp(op, fl.toInt(rewriter, op.getLoc(), adaptor.getInput(),
                                     op.getResult().getType()));
     return success();
@@ -380,6 +435,35 @@ struct ConvertFieldToArithPass
   void runOnOperation() override {
     MLIRContext *ctx = &getContext();
     ModuleOp module = getOperation();
+    if (invMethod != "fermat" && invMethod != "runtime") {
+      module.emitError("unknown inversion method '")
+          << invMethod << "'; expected 'fermat' or 'runtime'";
+      signalPassFailure();
+      return;
+    }
+    if (limbSpecialization != "generic" && limbSpecialization != "auto" &&
+        limbSpecialization != "compact") {
+      module.emitError("unknown limb specialization '")
+          << limbSpecialization
+          << "'; expected 'generic', 'auto', or "
+             "'compact'";
+      signalPassFailure();
+      return;
+    }
+    bool useRuntimeInv = invMethod == "runtime";
+    // No compact variant is enabled automatically until benchmarks establish
+    // a repeatable win. "compact" remains an explicit opt-in experiment.
+    bool useCompactIntermediates = limbSpecialization == "compact";
+    if (useRuntimeInv) {
+      OpBuilder builder(ctx);
+      builder.setInsertionPointToStart(module.getBody());
+      Type ptrTy = LLVM::LLVMPointerType::get(ctx);
+      Type i64Ty = builder.getI64Type();
+      Type voidTy = LLVM::LLVMVoidType::get(ctx);
+      auto fnTy = LLVM::LLVMFunctionType::get(
+          voidTy, {ptrTy, ptrTy, ptrTy, i64Ty}, false);
+      builder.create<LLVM::LLVMFuncOp>(module.getLoc(), "ff_rt_inv", fnTy);
+    }
 
     FieldTypeConverter converter(ctx);
 
@@ -387,6 +471,7 @@ struct ConvertFieldToArithPass
     target.addIllegalDialect<FieldDialect>();
     target.addLegalDialect<arith::ArithDialect>();
     target.addLegalDialect<func::FuncDialect>();
+    target.addLegalDialect<LLVM::LLVMDialect>();
     target.addLegalDialect<scf::SCFDialect>();
     target.addLegalOp<ModuleOp>();
 
@@ -400,8 +485,8 @@ struct ConvertFieldToArithPass
 
     RewritePatternSet patterns(ctx);
     patterns.add<AddLowering, SubLowering, MulLowering, NegLowering,
-                 InvLowering, FromIntLowering, ToIntLowering>(converter, ctx,
-                                                              useMontgomery);
+                 InvLowering, PowLowering, FromIntLowering, ToIntLowering>(
+        converter, ctx, useMontgomery, useRuntimeInv, useCompactIntermediates);
 
     populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns,
                                                                    converter);
