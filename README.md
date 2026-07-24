@@ -94,30 +94,3 @@ make perf       # perf-regression check vs a local baseline (make perf-baseline)
 `ffjit-doctor` (or `python3 -m ffjit._doctor`) diagnoses a broken setup:
 it checks for `ffc`, `clang`, numpy, a writable kernel cache, and finishes
 with a real end-to-end kernel compile.
-
-## Status
-
-Implemented and benchmarked (see [benchmark/RESULTS.md](benchmark/RESULTS.md)):
-
-- `field` MLIR dialect with Montgomery lowering, canonicalization patterns,
-  and compile-time constants specialized per modulus
-- scalar + batched (`FieldArray`) + multi-output kernels
-- radix-2 NTT with jitted butterflies, `Poly` with O(n log n) multiplication,
-  negacyclic convolution in GF(p)[x]/(x^n + 1) via psi-twisting
-- elliptic curves (BN254 G1, BLS12-381 G1, secp256k1): jitted Jacobian
-  kernels, GLV endomorphism decomposition, batch-affine Pippenger MSM
-  (Montgomery shared inversion, cross-window aggregation batching),
-  fixed-base comb tables
-
-Deliberately deferred, with reasons:
-
-- **CIOS word-level Montgomery lowering** -- LLVM already legalizes our wide
-  `iN` Montgomery arithmetic into limb operations; an explicit CIOS pass in
-  the dialect only pays off if it beats that legalization, which needs
-  careful measurement before committing to the (large) implementation.
-- **Traced loop primitives** (`ff.fori`) -- would let kernels contain
-  `scf.for` regions instead of unrolled straight-line code; the batch path
-  already covers the data-parallel cases that matter most.
-- **Pairings / extension-field towers** (GF(p^2), GF(p^12)) -- a
-  project-sized addition; the dialect's type system was designed so
-  extension elements can be added without breaking the existing lowering.
