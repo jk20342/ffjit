@@ -87,21 +87,3 @@ make            # builds mlir tools + runtime, then installs ffjit (editable)
 make test       # runtime C++ tests, MLIR lit tests, frontend pytest
 make bench      # BN254 benchmark vs galois / pure Python
 ```
-
-## Status
-
-- [x] Phase 0 -- end-to-end pipeline for word-sized primes
-- [x] Phase 1 -- multi-limb Montgomery arithmetic for 254-bit+ primes
-- [x] Phase 2a -- batched kernels: `FieldArray` + `f.map()` compiled loops
-      (7 ns/elem mul on Mersenne61 -- 19x faster than galois; see
-      [benchmark/RESULTS.md](benchmark/RESULTS.md))
-- [x] Phase 2b -- multi-output kernels, radix-2 NTT with jitted butterflies,
-      `Poly` with O(n log n) multiplication (157x over schoolbook at n=4096)
-- [x] Phase 3 -- elliptic curves (BN254 G1, secp256k1) with jitted Jacobian
-      double/add kernels and Pippenger MSM with batched bucket reduction
-- [x] Phase 4a -- GLV endomorphism decomposition (lattice-reduced scalars,
-      Straus-Shamir): 1.9x on scalar mult, MSM at 25.2x over pure Python
-- [ ] Phase 4b -- batch-affine MSM, pairings, wheels
-
-**Not constant-time.** Like `galois`, this is a research/prototyping tool;
-do not use it to handle secret key material.
