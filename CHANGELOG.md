@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0
+
+Performance and algorithmic depth.
+
+- Batch-affine Pippenger MSM: inputs normalized to affine with one shared
+  (Montgomery-trick) inversion, bucket reduction through a 3-multiplication
+  batch-affine add kernel, and running-sum aggregation batched across all
+  windows -- MSM over BN254 G1 improved from 25x to 36x over pure Python
+  (63 ms at n=512).
+- Fixed-base comb precomputation (`Point.precompute()`): table-backed
+  scalar multiplication with zero doublings, 5.8x over GLV double-and-add.
+- BLS12-381 G1 preset (`ff.bls12_381_g1()`), exercising the 7-limb
+  (381-bit) code path end to end; GLV-enabled.
+- Negacyclic convolution `ff.negacyclic_mul` in GF(p)[x]/(x^n + 1) via
+  psi-twisting (the Ring-LWE ring).
+- Poseidon-style hash demo (`demos/poseidon.py`): a full 65-round
+  permutation compiled into a single straight-line kernel.
+- `ffjit-doctor` console script: toolchain diagnosis ending in a real
+  end-to-end kernel compile.
+- Perf-regression harness (`make perf` / `make perf-baseline`) with local
+  JSON baselines and a slowdown tolerance gate.
+
 ## 0.1.0
 
 Initial release.

@@ -111,6 +111,41 @@ class Curve:
         self._dbl = dbl
         self._add = add
         self._glv = None  # set by enable_glv() for j-invariant-0 curves
+        self._aff_add_kernel = None
+        self._norm_kernel = None
+
+    @property
+    def _aff_add(self):
+        """Affine addition given a precomputed slope denominator inverse.
+
+        The inversion 1/(x2 - x1) is hoisted out and computed for a whole
+        batch at once with Montgomery's shared-inversion trick (in Python),
+        so the kernel is just 3 multiplications -- versus ~16 for the full
+        Jacobian add.
+        """
+        if self._aff_add_kernel is None:
+            @jit
+            def aff_add(x1, y1, x2, y2, dinv):
+                lam = (y2 - y1) * dinv
+                x3 = lam * lam - x1 - x2
+                y3 = lam * (x1 - x3) - y1
+                return x3, y3
+
+            self._aff_add_kernel = aff_add
+        return self._aff_add_kernel
+
+    @property
+    def _norm(self):
+        """(X, Y, 1/Z) -> affine (x, y): Jacobian normalization with the
+        inversion hoisted out for batching."""
+        if self._norm_kernel is None:
+            @jit
+            def norm(X, Y, zinv):
+                zi2 = zinv * zinv
+                return X * zi2, Y * zi2 * zinv
+
+            self._norm_kernel = norm
+        return self._norm_kernel
 
     # -- point construction --
     def point(self, x: int, y: int) -> "Point":
@@ -346,6 +381,22 @@ class Point:
 
     __mul__ = __rmul__
 
+    def precompute(self, order: int | None = None,
+                   window: int = 8) -> "FixedBase":
+        """Build a fixed-base comb table for repeated ``k * self``.
+
+        Precomputes d * 2^(j*c) * P for every window j and digit d, so a
+        subsequent scalar multiplication is ~ceil(bits/c) additions and
+        *zero* doublings (versus ~bits doublings + bits/2 additions for
+        double-and-add). ``order`` defaults to the GLV group order if the
+        curve has one.
+        """
+        if order is None:
+            if self.curve._glv is None:
+                raise ValueError("order is required on curves without GLV")
+            order = self.curve._glv["r"]
+        return FixedBase(self, order, window)
+
     def __repr__(self):
         if self.is_infinity:
             return f"Point(inf, {self.curve.name})"
@@ -353,9 +404,111 @@ class Point:
         return f"Point({x}, {y}, {self.curve.name})"
 
 
+class FixedBase:
+    """Fixed-base comb precomputation (Lim-Lee style, radix 2^c).
+
+    Stores T[j][d] = d * 2^(j*c) * P for j = 0..ceil(b/c)-1 and
+    d = 1..2^c-1. Then k*P = sum_j T[j][digit_j(k)]: one table lookup and
+    one addition per window -- no doublings at multiply time. The table is
+    built with batched compiled additions (one batch call per digit value,
+    each covering all windows at once) and stored in affine form via a
+    single shared inversion.
+
+    With c = 8 and a 255-bit order this is a 8160-point table built in
+    ~255 batch rounds, and each multiplication costs <= 32 additions --
+    roughly an order of magnitude fewer kernel calls than double-and-add.
+    """
+
+    __slots__ = ("curve", "order", "c", "nwin", "table")
+
+    def __init__(self, P: Point, order: int, window: int = 8):
+        if P.is_infinity:
+            raise ValueError("cannot precompute the point at infinity")
+        if not 1 <= window <= 16:
+            raise ValueError("window must be in [1, 16]")
+        curve = P.curve
+        self.curve = curve
+        self.order = order
+        self.c = window
+        self.nwin = (order.bit_length() + window - 1) // window
+
+        # bases[j] = 2^(j*c) * P via a doubling chain.
+        bases = [P]
+        for _ in range(self.nwin - 1):
+            Q = bases[-1]
+            for _ in range(window):
+                Q = Q.double()
+            bases.append(Q)
+
+        # rows[j][d] = d * bases[j], filled one digit value at a time with
+        # a batched add across all windows.
+        rows: List[List[Point]] = [[None] * (1 << window)
+                                   for _ in range(self.nwin)]
+        accs = list(bases)
+        for j in range(self.nwin):
+            rows[j][1] = bases[j]
+        for d in range(2, 1 << window):
+            accs = _batch_add(curve, accs, bases)
+            for j in range(self.nwin):
+                rows[j][d] = accs[j]
+
+        flat = [rows[j][d] for j in range(self.nwin)
+                for d in range(1, 1 << window)]
+        flat_affine = _batch_normalize(curve, flat)
+        self.table: List[List[Affine]] = []
+        stride = (1 << window) - 1
+        for j in range(self.nwin):
+            self.table.append(flat_affine[j * stride:(j + 1) * stride])
+
+    def mul(self, k: int) -> Point:
+        k = int(k) % self.order
+        if k == 0:
+            return self.curve.infinity()
+        acc = self.curve.infinity()
+        mask = (1 << self.c) - 1
+        for j in range(self.nwin):
+            d = (k >> (j * self.c)) & mask
+            if d:
+                x, y = self.table[j][d - 1]
+                acc = acc + Point(self.curve, x, y, 1)
+        return acc
+
+    def __rmul__(self, k: int) -> Point:
+        if not isinstance(k, int):
+            return NotImplemented
+        return self.mul(k)
+
+    __mul__ = __rmul__
+
+    def __repr__(self):
+        return (f"FixedBase({self.curve.name}, c={self.c}, "
+                f"{self.nwin * ((1 << self.c) - 1)} points)")
+
+
 # ---------------------------------------------------------------------------
 # Pippenger multi-scalar multiplication
 # ---------------------------------------------------------------------------
+
+def _batch_add_points(curve: Curve, Ps: List[Point],
+                      Qs: List[Point]) -> List[Point]:
+    """Pairwise Ps[i] + Qs[i], tolerating points at infinity (those pairs
+    resolve trivially in Python; the rest go through one batch call)."""
+    out: List[Point] = [None] * len(Ps)  # type: ignore[list-item]
+    idx, fP, fQ = [], [], []
+    for i, (P, Q) in enumerate(zip(Ps, Qs)):
+        if P.is_infinity:
+            out[i] = Q
+        elif Q.is_infinity:
+            out[i] = P
+        else:
+            idx.append(i)
+            fP.append(P)
+            fQ.append(Q)
+    if idx:
+        for i, R in zip(idx, _batch_add(curve, fP, fQ)):
+            out[i] = R
+    return out
+
 
 def _batch_add(curve: Curve, Ps: List[Point], Qs: List[Point]) -> List[Point]:
     """Add Ps[i] + Qs[i] for all i in one compiled batch call.
@@ -404,17 +557,111 @@ def _reduce_buckets(curve: Curve, buckets: dict) -> dict:
     }
 
 
+# -- batch-affine arithmetic (Montgomery shared inversion) --
+
+def _batch_inv(q: int, xs: List[int]) -> List[int]:
+    """Invert every element of ``xs`` (all nonzero) mod q with a single
+    modular inversion: prefix products, one pow(-1), back-substitution.
+    3(n-1) multiplications + 1 inversion instead of n inversions."""
+    n = len(xs)
+    prefix = [1] * (n + 1)
+    for i, x in enumerate(xs):
+        prefix[i + 1] = prefix[i] * x % q
+    inv = pow(prefix[n], -1, q)
+    out = [0] * n
+    for i in range(n - 1, -1, -1):
+        out[i] = prefix[i] * inv % q
+        inv = inv * xs[i] % q
+    return out
+
+
+Affine = Tuple[int, int]
+
+
+def _batch_normalize(curve: Curve, points: Sequence[Point]) -> List[Affine]:
+    """Jacobian -> affine for a whole batch: one shared inversion (Python)
+    plus a compiled 2-out normalization kernel. Inputs must be finite."""
+    F = curve.field
+    zinvs = _batch_inv(curve.q, [P.Z for P in points])
+    xs, ys = curve._norm.map(
+        FieldArray(F, [P.X for P in points]),
+        FieldArray(F, [P.Y for P in points]),
+        FieldArray(F, zinvs),
+    )
+    return list(zip(xs.to_ints(), ys.to_ints()))
+
+
+def _batch_affine_add(curve: Curve, Ps: List[Affine],
+                      Qs: List[Affine]) -> List[Affine | None]:
+    """Add affine points pairwise: Ps[i] + Qs[i]. Returns affine points, or
+    None for a result at infinity.
+
+    The slope denominators x2 - x1 are inverted together (one shared
+    inversion), then the compiled kernel finishes with 3 multiplications per
+    add. Pairs with x1 = x2 (a doubling or annihilation) are exceptional
+    and handled on the Python slow path -- rare for generic inputs.
+    """
+    q, F = curve.q, curve.field
+    n = len(Ps)
+    diffs = [(Qs[i][0] - Ps[i][0]) % q for i in range(n)]
+    good = [i for i in range(n) if diffs[i]]
+    out: List[Affine | None] = [None] * n
+
+    if good:
+        dinvs = _batch_inv(q, [diffs[i] for i in good])
+        x3s, y3s = curve._aff_add.map(
+            FieldArray(F, [Ps[i][0] for i in good]),
+            FieldArray(F, [Ps[i][1] for i in good]),
+            FieldArray(F, [Qs[i][0] for i in good]),
+            FieldArray(F, [Qs[i][1] for i in good]),
+            FieldArray(F, dinvs),
+        )
+        for i, x3, y3 in zip(good, x3s.to_ints(), y3s.to_ints()):
+            out[i] = (x3, y3)
+
+    for i in range(n):
+        if diffs[i] == 0:
+            if (Ps[i][1] + Qs[i][1]) % q == 0:
+                out[i] = None  # P + (-P) = infinity
+            else:
+                D = Point(curve, Ps[i][0], Ps[i][1], 1).double()
+                out[i] = D.to_affine()
+    return out
+
+
+def _reduce_buckets_affine(curve: Curve, buckets: dict) -> dict:
+    """Tree-reduce buckets of *affine* points with batch-affine additions."""
+    while True:
+        Ps: List[Affine] = []
+        Qs: List[Affine] = []
+        slots: List[int] = []
+        for d, lst in buckets.items():
+            while len(lst) >= 2:
+                Ps.append(lst.pop())
+                Qs.append(lst.pop())
+                slots.append(d)
+        if not Ps:
+            break
+        for d, R in zip(slots, _batch_affine_add(curve, Ps, Qs)):
+            if R is not None:
+                buckets[d].append(R)
+    return {
+        d: (Point(curve, lst[0][0], lst[0][1], 1) if lst
+            else curve.infinity())
+        for d, lst in buckets.items()
+    }
+
+
 def _default_window(n: int) -> int:
     """Window size for Pippenger.
 
-    The classical optimum c ~ log2(n) assumes every group addition costs the
-    same. Here the ~2^c sequential bucket-aggregation adds per window pay
-    full per-call overhead while the ~n tree-reduction adds are batched
-    (near-zero overhead each), which shifts the optimum down to roughly
-    log2(n)/2 -- confirmed by measurement (at n=512, c=5 is ~2.8x faster
-    than c=9).
+    The classical optimum c ~ log2(n) assumes every group addition costs
+    the same. Here all phases run as batch kernel calls, but the
+    aggregation still pays ~2*2^c batch-call *rounds* of fixed overhead,
+    which shifts the optimum down to roughly log2(n) - 3 -- confirmed by
+    measurement (c=5 at 256 pairs, c=7 at 1024, c=9 at 4096).
     """
-    return max(2, min(10, n.bit_length() // 2))
+    return max(2, min(12, n.bit_length() - 4))
 
 
 def msm(points: Sequence[Point], scalars: Sequence[int], *,
@@ -456,37 +703,63 @@ def msm(points: Sequence[Point], scalars: Sequence[int], *,
     if not pairs:
         return curve.infinity()
 
+    # Normalize every input point to affine once, up front, with a single
+    # shared inversion. All bucket work then runs in affine coordinates:
+    # a batched add costs 3 kernel multiplications (plus ~3 Python mulmods
+    # for the shared-inversion bookkeeping) versus ~16 for Jacobian.
+    affine = _batch_normalize(curve, [P for P, _ in pairs])
+    apairs = list(zip(affine, (k for _, k in pairs)))
+
     maxbits = max(k.bit_length() for _, k in pairs)
     c = window or _default_window(len(pairs))
     nwin = (maxbits + c - 1) // c
     mask = (1 << c) - 1
+
+    # All windows are processed simultaneously so that every phase runs as
+    # wide batch calls instead of per-window sequential kernel calls:
+    #   1. bucket every (point, digit) pair across all windows at once,
+    #   2. tree-reduce all (window, digit) buckets together (batch-affine),
+    #   3. run the running-sum aggregation digit by digit, batched across
+    #      windows (2 * 2^c batch rounds total, instead of ~2 * 2^c
+    #      sequential adds *per window*),
+    #   4. combine the per-window sums with a final doubling chain.
+    buckets: dict = {}
+    for A, k in apairs:
+        w = 0
+        while k:
+            d = k & mask
+            if d:
+                buckets.setdefault((w, d), []).append(A)
+            k >>= c
+            w += 1
+    if not buckets:
+        return curve.infinity()
+    reduced = _reduce_buckets_affine(curve, buckets)
+
+    # Per-window running-sum aggregation, batched across windows:
+    # for d = 2^c-1 .. 1:  running_w += B_{w,d};  acc_w += running_w.
+    # This yields acc_w = sum_d d * B_{w,d}.
+    running = [curve.infinity()] * nwin
+    acc = [curve.infinity()] * nwin
+    maxdigit = max(d for _, d in reduced)
+    for d in range(maxdigit, 0, -1):
+        hits = [w for w in range(nwin) if (w, d) in reduced]
+        if hits:
+            summed = _batch_add_points(
+                curve,
+                [running[w] for w in hits],
+                [reduced[(w, d)] for w in hits],
+            )
+            for w, R in zip(hits, summed):
+                running[w] = R
+        acc = _batch_add_points(curve, acc, running)
 
     result = curve.infinity()
     for w in range(nwin - 1, -1, -1):
         if not result.is_infinity:
             for _ in range(c):
                 result = result.double()
-
-        buckets: dict = {}
-        for P, k in pairs:
-            d = (k >> (w * c)) & mask
-            if d:
-                buckets.setdefault(d, []).append(P)
-        if not buckets:
-            continue
-        reduced = _reduce_buckets(curve, buckets)
-
-        # sum_d d * B_d, digits descending: keep a running sum of buckets
-        # and weight it by the gap to the next (smaller) digit present.
-        digits = sorted(reduced, reverse=True)
-        running = curve.infinity()
-        acc = curve.infinity()
-        for i, d in enumerate(digits):
-            running = running + reduced[d]
-            gap = d - (digits[i + 1] if i + 1 < len(digits) else 0)
-            acc = acc + (gap * running if gap > 1 else running)
-        result = result + acc
-
+        result = result + acc[w]
     return result
 
 
@@ -502,6 +775,21 @@ def bn254_g1() -> Tuple[Curve, Point, int]:
     r = 21888242871839275222246405745257275088548364400416034343698204186575808495617
     curve = Curve(GF(q), 0, 3, name="BN254 G1")
     G = curve.point(1, 2)
+    curve.enable_glv(r, G)
+    return curve, G, r
+
+
+@functools.lru_cache(maxsize=None)
+def bls12_381_g1() -> Tuple[Curve, Point, int]:
+    """BLS12-381 G1: y^2 = x^3 + 4 over a 381-bit prime field (a 7-limb
+    modulus -- one limb wider than BN254). Returns (curve, generator,
+    subgroup order r). GLV-enabled."""
+    q = 0x1A0111EA397FE69A4B1BA7B6434BACD764774B84F38512BF6730D2A0F6B0F6241EABFFFEB153FFFFB9FEFFFFFFFFAAAB
+    r = 0x73EDA753299D7D483339D80809A1D80553BDA402FFFE5BFEFFFFFFFF00000001
+    gx = 0x17F1D3A73197D7942695638C4FA9AC0FC3688C4F9774B905A14E3A3F171BAC586C55E83FF97A1AEFFB3AF00ADB22C6BB
+    gy = 0x08B3F481E3AAA0F1A09E30ED741D8AE4FCF5E095D5D00AF600DB18CB2C04B3EDD03CC744A2888AE40CAA232946C5E7E1
+    curve = Curve(GF(q), 0, 4, name="BLS12-381 G1")
+    G = curve.point(gx, gy)
     curve.enable_glv(r, G)
     return curve, G, r
 

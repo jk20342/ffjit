@@ -7,6 +7,7 @@ runtime/build/
 __pycache__/
 *.egg-info/
 .ffjit_cache/
+.ffjit_perf.json
 .venv/
 .pytest_cache/
 .hypothesis/

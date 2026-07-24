@@ -13,6 +13,7 @@ import ffjit as ff
 CURVES = {
     "bn254_g1": ff.bn254_g1,
     "secp256k1": ff.secp256k1,
+    "bls12_381_g1": ff.bls12_381_g1,  # 381-bit: exercises the 7-limb path
 }
 
 
@@ -166,3 +167,71 @@ def test_msm_single_point():
     curve, G, r = ff.bn254_g1()
     k = 0xDEADBEEFCAFEBABE
     assert ff.msm([G], [k]) == k * G
+
+
+# ---- batch-affine internals ----
+
+def test_batch_inv():
+    from ffjit.curve import _batch_inv
+    q = ff.bn254_g1()[0].q
+    rng = random.Random(6)
+    xs = [rng.randrange(1, q) for _ in range(37)]
+    assert all(x * y % q == 1 for x, y in zip(xs, _batch_inv(q, xs)))
+
+
+def test_batch_affine_add_exceptional_cases():
+    from ffjit.curve import _batch_affine_add
+    curve, G, r = ff.bn254_g1()
+    P2, P3 = (2 * G).to_affine(), (3 * G).to_affine()
+    neg2 = (-(2 * G)).to_affine()
+    # generic add, doubling (x1 == x2, y1 == y2), annihilation (P + -P)
+    out = _batch_affine_add(curve, [P2, P2, P2], [P3, P2, neg2])
+    assert out[0] == (5 * G).to_affine()
+    assert out[1] == (4 * G).to_affine()
+    assert out[2] is None
+
+
+def test_batch_normalize():
+    from ffjit.curve import _batch_normalize
+    curve, G, r = ff.bn254_g1()
+    pts = [k * G for k in range(2, 12)]  # Jacobian, Z != 1
+    for aff, P in zip(_batch_normalize(curve, pts), pts):
+        assert aff == P.to_affine()
+
+
+# ---- fixed-base comb ----
+
+def test_fixed_base_matches_double_and_add(group):
+    curve, G, r = group
+    T = G.precompute(window=4)
+    rng = random.Random(7)
+    for k in [0, 1, 2, r - 1, r, r + 5, rng.randrange(r)]:
+        assert T.mul(k) == (k % r) * G
+    assert T.mul(0).is_infinity
+
+
+def test_fixed_base_rmul_and_repr():
+    curve, G, r = ff.bn254_g1()
+    T = G.precompute(window=3)
+    k = 987654321987654321
+    assert k * T == k * G
+    assert "FixedBase" in repr(T)
+
+
+def test_fixed_base_requires_order_without_glv():
+    F = ff.GF(2**61 - 1)  # Mersenne prime (= 3 mod 4), no GLV setup
+    curve = ff.Curve(F, 0, 7)
+    # find a point by brute force over small x
+    q = curve.q
+    P = None
+    for x in range(1, 200):
+        rhs = (x * x * x + 7) % q
+        y = pow(rhs, (q + 1) // 4, q)
+        if y * y % q == rhs:
+            P = curve.point(x, y)
+            break
+    assert P is not None
+    with pytest.raises(ValueError):
+        P.precompute()
+    T = P.precompute(order=q + 1, window=2)  # any bound >= point order works
+    assert T.mul(5) == 5 * P

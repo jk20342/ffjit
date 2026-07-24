@@ -18,7 +18,18 @@ jobs:
           sudo apt-get install -y libmlir-21-dev mlir-21-tools ninja-build cmake
 
       - name: Install Python dependencies
-        run: python3 -m pip install --user pytest hypothesis numpy
+        run: python3 -m pip install --user pytest hypothesis numpy lit
+
+      # Compiled kernels are keyed by content hash (MLIR text + ABI version),
+      # so restoring a stale cache is harmless -- unmatched entries are
+      # ignored. This mainly saves the ~5 min first compile of the Poseidon
+      # demo's 1400-op kernel.
+      - name: Cache compiled kernels
+        uses: actions/cache@v4
+        with:
+          path: .ffjit_cache
+          key: ffjit-kernels-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ffjit-kernels-${{ runner.os }}-
 
       - name: Build MLIR tools and runtime
         run: make mlir runtime

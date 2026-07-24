@@ -12,11 +12,11 @@ GF(65537)(...)
 """
 
 from .array import FieldArray
-from .curve import Curve, Point, bn254_g1, msm, secp256k1
+from .curve import Curve, FixedBase, Point, bls12_381_g1, bn254_g1, msm, secp256k1
 from .errors import CompileError, TraceError
 from .field import GF, FieldVal, num_limbs, storage_bits
 from .jit import JittedFunction, jit
-from .ntt import intt, ntt, root_of_unity, two_adicity
+from .ntt import intt, negacyclic_mul, ntt, root_of_unity, two_adicity
 from .poly import Poly
 
 __all__ = [
@@ -26,8 +26,10 @@ __all__ = [
     "Poly",
     "Curve",
     "Point",
+    "FixedBase",
     "msm",
     "bn254_g1",
+    "bls12_381_g1",
     "secp256k1",
     "jit",
     "JittedFunction",
@@ -35,9 +37,10 @@ __all__ = [
     "CompileError",
     "ntt",
     "intt",
+    "negacyclic_mul",
     "two_adicity",
     "root_of_unity",
     "storage_bits",
     "num_limbs",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

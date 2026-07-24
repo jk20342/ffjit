@@ -3,32 +3,51 @@
 ## Elliptic-curve multi-scalar multiplication (Phase 3)
 
 Workload: \(\sum_i k_i P_i\) over **BN254 G1** with random points and full
-254-bit scalars. ffjit uses Pippenger's bucket method with bucket
-accumulation executed as batched tree reduction through the JIT-compiled
-Jacobian add kernel (6-in/3-out). References: the same compiled kernels with
-the naive per-point double-and-add algorithm, and pure-Python affine
+254-bit scalars. ffjit uses Pippenger's bucket method, *fully batched*: all
+inputs are normalized to affine with one shared inversion, bucket reduction
+runs through a 3-multiplication batch-affine add kernel (Montgomery shared
+inversion for the slopes), and the running-sum aggregation is batched
+across all windows simultaneously. References: the same compiled kernels
+with the naive per-point double-and-add algorithm, and pure-Python affine
 double-and-add (the typical prototype code). Run with
 `PYTHONPATH=frontend python3 benchmark/bench_msm.py`.
 
 | N | ffjit Pippenger+GLV | per-point (jitted, GLV) | pure Python | speedup |
 |---|---|---|---|---|
-| 128 | 48 ms | 352 ms | 526 ms | 10.9x |
-| 512 | 95 ms | 1.34 s | 2.38 s | **25.2x** |
-| 2048 | 267 ms (130 us/pt) | -- | -- | -- |
+| 128 | 22 ms | 322 ms | 556 ms | 25.4x |
+| 512 | 63 ms | 1.32 s | 2.28 s | **36.0x** |
+| 2048 | 209 ms (102 us/pt) | -- | -- | -- |
 
-Two points of interest:
+Points of interest:
 
-- The classical Pippenger window optimum \(c \approx \log_2 n\) assumes
-  uniform addition cost. Here batched tree-reduction adds are nearly free
-  per element while the \(\sim 2^c\) sequential bucket-aggregation adds each
-  pay full FFI call overhead, shifting the optimum to \(c \approx
-  \log_2(n)/2\) -- measured 2.8x faster than the classical choice at n=512.
-- **GLV endomorphism decomposition** (automatic for BN254 G1 and secp256k1,
-  both j-invariant 0): each scalar splits as \(k = k_1 + k_2\lambda\) with
-  \(|k_i| \lesssim \sqrt{r}\) via a lattice basis found by the extended
-  Euclidean algorithm. Scalar multiplication gains ~1.9x (Straus-Shamir
-  joint evaluation halves the doublings); MSM gains ~14% (half the window
-  passes, but twice the points into buckets). See `doc/THEORY.md`.
+- **Batch-affine arithmetic**: Montgomery's shared-inversion trick turns n
+  modular inversions into 3(n-1) multiplications + 1 inversion, so bucket
+  adds run in affine coordinates at 3 kernel multiplications each instead
+  of ~16 for Jacobian.
+- **Cross-window aggregation batching**: the classical per-window
+  running-sum aggregation is ~2*2^c *sequential* kernel calls per window.
+  Processing all windows' buckets simultaneously turns these into ~2*2^c
+  *batch* calls total (each covering every window at once), which roughly
+  doubled MSM throughput and moved the optimal window back up to
+  \(c \approx \log_2 n - 3\) (measured: c=5 at 256 pairs, c=9 at 4096).
+- **GLV endomorphism decomposition** (automatic for BN254 G1, BLS12-381 G1
+  and secp256k1, all j-invariant 0): each scalar splits as
+  \(k = k_1 + k_2\lambda\) with \(|k_i| \lesssim \sqrt{r}\) via a lattice
+  basis found by the extended Euclidean algorithm. Scalar multiplication
+  gains ~1.9x (Straus-Shamir joint evaluation halves the doublings). See
+  `doc/THEORY.md`.
+
+### Fixed-base scalar multiplication (comb precomputation)
+
+For a repeatedly used base point (`G.precompute(window=8)`), a Lim-Lee comb
+table T[j][d] = d * 2^(8j) * G (8160 points, built in ~40 ms with batched
+adds and stored affine via one shared inversion) reduces every subsequent
+multiplication to <= 32 additions with **zero doublings**:
+
+| method | per k*G |
+|---|---|
+| comb table (c=8) | **0.43 ms** |
+| GLV + Straus-Shamir double-and-add | 2.53 ms (5.8x slower) |
 
 ## NTT polynomial multiplication (Phase 2b)
 

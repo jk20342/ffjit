@@ -159,3 +159,52 @@ def test_poly_eval_agrees_with_mul():
     b = ff.Poly(F, [rng.randrange(p) for _ in range(70)])
     x = rng.randrange(p)
     assert int((a * b)(x)) == int(a(x)) * int(b(x)) % p
+
+
+# ---- negacyclic convolution ----
+
+def _negacyclic_naive(a, b, p):
+    """c_k = sum_{i+j = k} a_i b_j - sum_{i+j = n+k} a_i b_j (mod p)."""
+    n = len(a)
+    out = [0] * n
+    for i in range(n):
+        for j in range(n):
+            k = i + j
+            if k < n:
+                out[k] = (out[k] + a[i] * b[j]) % p
+            else:
+                out[k - n] = (out[k - n] - a[i] * b[j]) % p
+    return out
+
+
+@pytest.mark.parametrize("p", NTT_PRIMES)
+@pytest.mark.parametrize("logn", [0, 1, 4, 7])
+def test_negacyclic_matches_naive(p, logn):
+    F = ff.GF(p)
+    n = 1 << logn
+    rng = random.Random(8)
+    a = [rng.randrange(p) for _ in range(n)]
+    b = [rng.randrange(p) for _ in range(n)]
+    got = ff.negacyclic_mul(ff.FieldArray(F, a), ff.FieldArray(F, b))
+    assert got.to_ints() == _negacyclic_naive(a, b, p)
+
+
+def test_negacyclic_x_to_n_is_minus_one():
+    # x^(n/2) * x^(n/2) = x^n = -1 in GF(p)[x]/(x^n + 1)
+    p = P_BN254
+    F = ff.GF(p)
+    n = 16
+    half = [0] * n
+    half[n // 2] = 1
+    got = ff.negacyclic_mul(ff.FieldArray(F, half), ff.FieldArray(F, half))
+    expected = [0] * n
+    expected[0] = p - 1
+    assert got.to_ints() == expected
+
+
+def test_negacyclic_rejects_mismatched_operands():
+    F = ff.GF(P_BN254)
+    with pytest.raises(ValueError):
+        ff.negacyclic_mul(ff.FieldArray(F, [1, 2]), ff.FieldArray(F, [1, 2, 3, 4]))
+    with pytest.raises(ValueError):
+        ff.negacyclic_mul(ff.FieldArray(F, [1, 2, 3]), ff.FieldArray(F, [1, 2, 3]))

@@ -2,9 +2,11 @@ PYTHON ?= python3
 MLIR_DIR ?= /usr/lib/llvm-21/lib/cmake/mlir
 LLVM_DIR ?= /usr/lib/llvm-21/lib/cmake/llvm
 BUILD_TYPE ?= Release
-LIT ?= /usr/lib/llvm-21/bin/lit
+# lit ships with some LLVM packages but not the apt.llvm.org ones;
+# fall back to a pip-installed `lit` on PATH (pip install lit).
+LIT ?= $(shell command -v /usr/lib/llvm-21/bin/lit || command -v lit || echo lit)
 
-.PHONY: all mlir runtime frontend test test-runtime test-mlir test-frontend bench lint format clean
+.PHONY: all mlir runtime frontend test test-runtime test-mlir test-frontend bench perf perf-baseline lint format clean
 
 all: mlir runtime frontend
 
@@ -38,6 +40,13 @@ bench: mlir
 	PYTHONPATH=frontend $(PYTHON) benchmark/bench_batch.py
 	PYTHONPATH=frontend $(PYTHON) benchmark/bench_ntt.py
 	PYTHONPATH=frontend $(PYTHON) benchmark/bench_msm.py
+
+# quick perf-regression check against a locally recorded baseline
+perf: mlir
+	PYTHONPATH=frontend $(PYTHON) benchmark/perf.py
+
+perf-baseline: mlir
+	PYTHONPATH=frontend $(PYTHON) benchmark/perf.py --save
 
 demo: mlir
 	PYTHONPATH=frontend $(PYTHON) demos/demo.py

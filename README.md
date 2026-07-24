@@ -27,11 +27,20 @@ a = ff.Poly(F, range(1, 4097))
 b = ff.Poly(F, range(2, 4098))
 c = a * b                                # 157x faster than schoolbook
 
-# elliptic curves: jitted Jacobian kernels, GLV endomorphisms, Pippenger MSM
-curve, G, r = ff.bn254_g1()
+# elliptic curves: jitted kernels, GLV endomorphisms, batch-affine Pippenger MSM
+curve, G, r = ff.bn254_g1()              # also: bls12_381_g1(), secp256k1()
 points  = [k * G for k in range(2, 514)]         # k*G uses GLV automatically
 scalars = [pow(k, 99, r) for k in range(2, 514)]
-S = ff.msm(points, scalars)              # 25x faster than pure Python
+S = ff.msm(points, scalars)              # 36x faster than pure Python
+
+# fixed-base comb: repeated k*G with zero doublings per multiply
+T = G.precompute()                       # 8160-point table, ~40 ms
+Q = 123456789 * T                        # 5.8x faster than double-and-add
+
+# negacyclic convolution in GF(p)[x]/(x^n + 1)  (the Ring-LWE ring)
+u = ff.FieldArray(F, range(1, 1025))
+v = ff.FieldArray(F, range(2, 1026))
+w = ff.negacyclic_mul(u, v)
 ```
 
 ## Why
@@ -48,14 +57,7 @@ S = ff.msm(points, scalars)              # 25x faster than pure Python
   precomputed constants \(p'\), \(R^2 \bmod p\), and (later) NTT-based
   polynomial multiplication and Pippenger multi-scalar multiplication.
 
-See [doc/THEORY.md](doc/THEORY.md) for the mathematics (Montgomery's REDC,
-Hensel lifting for \(p^{-1} \bmod 2^W\), Fermat inversion) and an annotated
-bibliography.
-
 ## Architecture
-
-Modeled on [PennyLane Catalyst](https://github.com/PennyLaneAI/catalyst)
-(a clone lives in `catalyst/` as a read-only reference):
 
 ```
 Python @ff.jit function
@@ -86,4 +88,36 @@ Requires: CMake >= 3.20, Ninja, a C++17 compiler, LLVM/MLIR 21 dev packages
 make            # builds mlir tools + runtime, then installs ffjit (editable)
 make test       # runtime C++ tests, MLIR lit tests, frontend pytest
 make bench      # BN254 benchmark vs galois / pure Python
+make perf       # perf-regression check vs a local baseline (make perf-baseline)
 ```
+
+`ffjit-doctor` (or `python3 -m ffjit._doctor`) diagnoses a broken setup:
+it checks for `ffc`, `clang`, numpy, a writable kernel cache, and finishes
+with a real end-to-end kernel compile.
+
+## Status
+
+Implemented and benchmarked (see [benchmark/RESULTS.md](benchmark/RESULTS.md)):
+
+- `field` MLIR dialect with Montgomery lowering, canonicalization patterns,
+  and compile-time constants specialized per modulus
+- scalar + batched (`FieldArray`) + multi-output kernels
+- radix-2 NTT with jitted butterflies, `Poly` with O(n log n) multiplication,
+  negacyclic convolution in GF(p)[x]/(x^n + 1) via psi-twisting
+- elliptic curves (BN254 G1, BLS12-381 G1, secp256k1): jitted Jacobian
+  kernels, GLV endomorphism decomposition, batch-affine Pippenger MSM
+  (Montgomery shared inversion, cross-window aggregation batching),
+  fixed-base comb tables
+
+Deliberately deferred, with reasons:
+
+- **CIOS word-level Montgomery lowering** -- LLVM already legalizes our wide
+  `iN` Montgomery arithmetic into limb operations; an explicit CIOS pass in
+  the dialect only pays off if it beats that legalization, which needs
+  careful measurement before committing to the (large) implementation.
+- **Traced loop primitives** (`ff.fori`) -- would let kernels contain
+  `scf.for` regions instead of unrolled straight-line code; the batch path
+  already covers the data-parallel cases that matter most.
+- **Pairings / extension-field towers** (GF(p^2), GF(p^12)) -- a
+  project-sized addition; the dialect's type system was designed so
+  extension elements can be added without breaking the existing lowering.

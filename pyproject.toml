@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ffjit"
-version = "0.1.0"
+version = "0.2.0"
 description = "MLIR-based JIT compiler for prime-field arithmetic in Python (arbitrary-size moduli)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,11 @@ license = { text = "Apache-2.0" }
 keywords = ["finite-field", "JIT", "MLIR", "cryptography", "zero-knowledge"]
 
 [project.optional-dependencies]
-test = ["pytest", "hypothesis"]
+batch = ["numpy"]
+test = ["pytest", "hypothesis", "numpy"]
+
+[project.scripts]
+ffjit-doctor = "ffjit._doctor:main"
 
 [tool.setuptools.packages.find]
 where = ["frontend"]

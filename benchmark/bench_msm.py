@@ -88,6 +88,26 @@ def main():
     print("\nper-point jit = compiled kernels but naive algorithm;")
     print("Pippenger's gain over it is pure algorithm + batching.")
 
+    # fixed-base comb: repeated k*G for a known base point
+    print("\nfixed-base scalar mult (k*G, comb table, c=8)")
+    t0 = time.perf_counter()
+    T = G.precompute(window=8)
+    t_pre = time.perf_counter() - t0
+    k = rng.randrange(1, r)
+    assert T.mul(k) == k * G
+    reps = 50
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        T.mul(k)
+    t_fb = (time.perf_counter() - t0) / reps
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        k * G  # GLV + Straus-Shamir double-and-add
+    t_glv = (time.perf_counter() - t0) / reps
+    print(f"  table build: {t_pre*1e3:.0f} ms ({T.nwin * 255} points)")
+    print(f"  per mult: comb {t_fb*1e3:.2f} ms vs GLV double-and-add "
+          f"{t_glv*1e3:.2f} ms  ({t_glv/t_fb:.1f}x)")
+
 
 if __name__ == "__main__":
     main()

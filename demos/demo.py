@@ -111,6 +111,33 @@ def main():
         + scalars[2] * points[2]
     print("spot check ok =", check == direct)
 
+    banner("8. Fixed-base comb: repeated k*G with zero doublings")
+    t0 = time.perf_counter()
+    T = G.precompute()  # 8160-point comb table, batched build
+    dt = time.perf_counter() - t0
+    print(f"table build: {dt*1e3:.0f} ms  ({T!r})")
+    k = rng.randrange(1, r)
+    t0 = time.perf_counter()
+    Q = k * T
+    dt = time.perf_counter() - t0
+    print(f"one k*G via comb: {dt*1e3:.2f} ms, correct = {Q == k * G}")
+
+    banner("9. Negacyclic convolution in GF(p)[x]/(x^n + 1)")
+    n = 1024
+    u = ff.FieldArray(K, [rng.randrange(BN254) for _ in range(n)])
+    v = ff.FieldArray(K, [rng.randrange(BN254) for _ in range(n)])
+    ff.negacyclic_mul(u, v)  # warm-up
+    t0 = time.perf_counter()
+    w = ff.negacyclic_mul(u, v)
+    dt = time.perf_counter() - t0
+    # x^(n/2) * x^(n/2) = -1 sanity check
+    half = [0] * n
+    half[n // 2] = 1
+    hs = ff.negacyclic_mul(ff.FieldArray(K, half), ff.FieldArray(K, half))
+    print(f"n={n} negacyclic product in {dt*1e3:.1f} ms; "
+          f"x^n = -1 check ok = {hs.to_ints()[0] == BN254 - 1}")
+    assert w.N == n
+
 
 if __name__ == "__main__":
     main()

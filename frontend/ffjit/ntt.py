@@ -80,7 +80,7 @@ class NTTPlan:
     twiddle arrays (forward and inverse), all in native limb buffers.
     """
 
-    def __init__(self, field: type, logn: int):
+    def __init__(self, field: type, logn: int, *, w: int | None = None):
         if _np is None:
             raise RuntimeError("the NTT requires numpy for buffer reshaping")
         p = field.modulus
@@ -89,7 +89,14 @@ class NTTPlan:
         self.n = 1 << logn
         self.nl = num_limbs(p)
 
-        self.w = root_of_unity(p, logn)
+        if w is not None:
+            if pow(w, self.n, p) != 1 or (
+                logn > 0 and pow(w, self.n >> 1, p) == 1
+            ):
+                raise ValueError(f"{w} is not a primitive 2^{logn}-th root")
+            self.w = w
+        else:
+            self.w = root_of_unity(p, logn)
         self.winv = pow(self.w, -1, p)
         self.ninv = pow(self.n, -1, p)
 
@@ -172,3 +179,62 @@ def intt(fa: FieldArray) -> FieldArray:
     if n & (n - 1):
         raise ValueError("NTT length must be a power of two")
     return get_plan(fa.field, n.bit_length() - 1).intt(fa)
+
+
+# ---------------------------------------------------------------------------
+# Negacyclic convolution (multiplication in GF(p)[x] / (x^n + 1))
+# ---------------------------------------------------------------------------
+
+class NegacyclicPlan:
+    """Multiplication in the ring GF(p)[x] / (x^n + 1) via psi-twisting.
+
+    The cyclic NTT computes convolution mod x^n - 1. For the *negacyclic*
+    ring (wrapped coefficients pick up a minus sign -- the ring underlying
+    Ring-LWE cryptosystems such as Kyber and Dilithium), evaluate at odd
+    powers of a primitive 2n-th root psi instead: with a'_i = psi^i * a_i,
+
+        NEGACONV(a, b)_k = psi^{-k} * CYCLICCONV(a', b')_k,
+
+    because psi^n = -1 turns the wraparound x^n = 1 into x^n = -1. Needs
+    2-adicity >= logn + 1. The twists are batched pointwise kernel calls,
+    so the whole product is still O(n log n) with no per-element Python.
+    """
+
+    def __init__(self, field: type, logn: int):
+        p = field.modulus
+        self.field = field
+        self.n = 1 << logn
+        psi = root_of_unity(p, logn + 1)
+        # Base the cyclic transform on w = psi^2 so the twist and the
+        # transform share one coherent root system.
+        self.plan = NTTPlan(field, logn, w=psi * psi % p)
+
+        psi_inv = pow(psi, -1, p)
+        pows, ipows = [1] * self.n, [1] * self.n
+        for i in range(1, self.n):
+            pows[i] = pows[i - 1] * psi % p
+            ipows[i] = ipows[i - 1] * psi_inv % p
+        self.psi_pows = FieldArray(field, pows)
+        self.psi_inv_pows = FieldArray(field, ipows)
+
+    def mul(self, a: FieldArray, b: FieldArray) -> FieldArray:
+        at = _pointwise_mul.map(a, self.psi_pows)
+        bt = _pointwise_mul.map(b, self.psi_pows)
+        C = _pointwise_mul.map(self.plan.ntt(at), self.plan.ntt(bt))
+        return _pointwise_mul.map(self.plan.intt(C), self.psi_inv_pows)
+
+
+_neg_plans = {}
+
+
+def negacyclic_mul(a: FieldArray, b: FieldArray) -> FieldArray:
+    """Product of two length-n coefficient vectors in GF(p)[x] / (x^n + 1)."""
+    n = a.N
+    if n != b.N or a.field is not b.field:
+        raise ValueError("operands must share length and field")
+    if n & (n - 1):
+        raise ValueError("negacyclic length must be a power of two")
+    key = (a.field.modulus, n)
+    if key not in _neg_plans:
+        _neg_plans[key] = NegacyclicPlan(a.field, n.bit_length() - 1)
+    return _neg_plans[key].mul(a, b)
