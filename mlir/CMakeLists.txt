@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The lowering passes and the ffc driver are the core of the project; the
+# switch exists only for bisecting dialect-only build issues.
+option(FFJIT_ENABLE_TRANSFORMS
+       "Build the field-to-arith transforms and the ffc driver" ON)
+
 find_package(MLIR REQUIRED CONFIG)
 
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
