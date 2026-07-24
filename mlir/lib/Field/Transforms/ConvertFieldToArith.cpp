@@ -43,15 +43,15 @@ namespace {
 /// emit the corresponding arith IR. Values in the "storage" width W are field
 /// representatives in [0, p); intermediate products use a wide type.
 struct FieldLowering {
-  unsigned W;         // storage bit width = 64 * nlimbs, R = 2^W > p
-  unsigned Wbig;      // wide width for products/REDC (2W + 64, no overflow)
-  APInt p;            // modulus, width W
-  APInt pInv;         // (-p^{-1}) mod 2^W, width W
-  APInt R2;           // 2^(2W) mod p, width W (value < p)
+  unsigned W;    // storage bit width = 64 * nlimbs, R = 2^W > p
+  unsigned Wbig; // wide width for products/REDC (2W + 64, no overflow)
+  APInt p;       // modulus, width W
+  APInt pInv;    // (-p^{-1}) mod 2^W, width W
+  APInt R2;      // 2^(2W) mod p, width W (value < p)
   bool montgomery;
 
-  Type ti;    // IntegerType(W)
-  Type tbig;  // IntegerType(Wbig)
+  Type ti;   // IntegerType(W)
+  Type tbig; // IntegerType(Wbig)
 
   FieldLowering(ElementType elem, bool mont, MLIRContext *ctx) {
     montgomery = mont;
@@ -100,7 +100,8 @@ struct FieldLowering {
   /// truncate to the storage type (result in [0, p)).
   Value condSubAndTrunc(OpBuilder &b, Location loc, Value wide) const {
     Value pB = cstTbig(b, loc, p);
-    Value ge = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::uge, wide, pB);
+    Value ge =
+        b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::uge, wide, pB);
     Value sub = b.create<arith::SubIOp>(loc, wide, pB);
     Value sel = b.create<arith::SelectOp>(loc, ge, sub, wide);
     return trunc(b, loc, sel, ti);
@@ -168,7 +169,8 @@ struct FieldLowering {
     Value aB = zext(b, loc, a, tbig);
     Value pB = cstTbig(b, loc, p);
     Value zero = cstTbig(b, loc, APInt(Wbig, 0));
-    Value isz = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, aB, zero);
+    Value isz =
+        b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, aB, zero);
     Value pm = b.create<arith::SubIOp>(loc, pB, aB);
     Value sel = b.create<arith::SelectOp>(loc, isz, zero, pm);
     return trunc(b, loc, sel, ti);
@@ -270,8 +272,7 @@ struct FieldTypeConverter : public TypeConverter {
   }
 };
 
-template <typename OpT>
-struct FieldOpPattern : OpConversionPattern<OpT> {
+template <typename OpT> struct FieldOpPattern : OpConversionPattern<OpT> {
   FieldOpPattern(const TypeConverter &tc, MLIRContext *ctx, bool mont)
       : OpConversionPattern<OpT>(tc, ctx), montgomery(mont) {}
   bool montgomery;
@@ -284,8 +285,8 @@ struct AddLowering : FieldOpPattern<AddOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getResult().getType());
     auto fl = makeLowering(elem, montgomery);
-    rewriter.replaceOp(op, fl.add(rewriter, op.getLoc(), adaptor.getLhs(),
-                                  adaptor.getRhs()));
+    rewriter.replaceOp(
+        op, fl.add(rewriter, op.getLoc(), adaptor.getLhs(), adaptor.getRhs()));
     return success();
   }
 };
@@ -297,8 +298,8 @@ struct SubLowering : FieldOpPattern<SubOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getResult().getType());
     auto fl = makeLowering(elem, montgomery);
-    rewriter.replaceOp(op, fl.sub(rewriter, op.getLoc(), adaptor.getLhs(),
-                                  adaptor.getRhs()));
+    rewriter.replaceOp(
+        op, fl.sub(rewriter, op.getLoc(), adaptor.getLhs(), adaptor.getRhs()));
     return success();
   }
 };
@@ -310,8 +311,8 @@ struct MulLowering : FieldOpPattern<MulOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getResult().getType());
     auto fl = makeLowering(elem, montgomery);
-    rewriter.replaceOp(op, fl.mul(rewriter, op.getLoc(), adaptor.getLhs(),
-                                  adaptor.getRhs()));
+    rewriter.replaceOp(
+        op, fl.mul(rewriter, op.getLoc(), adaptor.getLhs(), adaptor.getRhs()));
     return success();
   }
 };
@@ -347,7 +348,8 @@ struct FromIntLowering : FieldOpPattern<FromIntOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto elem = cast<ElementType>(op.getResult().getType());
     auto fl = makeLowering(elem, montgomery);
-    rewriter.replaceOp(op, fl.fromInt(rewriter, op.getLoc(), adaptor.getInput()));
+    rewriter.replaceOp(op,
+                       fl.fromInt(rewriter, op.getLoc(), adaptor.getInput()));
     return success();
   }
 };
@@ -398,8 +400,8 @@ struct ConvertFieldToArithPass
 
     RewritePatternSet patterns(ctx);
     patterns.add<AddLowering, SubLowering, MulLowering, NegLowering,
-                 InvLowering, FromIntLowering, ToIntLowering>(
-        converter, ctx, useMontgomery);
+                 InvLowering, FromIntLowering, ToIntLowering>(converter, ctx,
+                                                              useMontgomery);
 
     populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns,
                                                                    converter);

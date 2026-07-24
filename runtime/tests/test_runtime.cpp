@@ -22,9 +22,8 @@ namespace {
 //===--------------------------------------------------------------------===//
 
 void testSingleLimbPrime(uint64_t p) {
-  const uint64_t values[] = {1,      2,          3,          65536,
-                             12345,  0xdeadbeef, 0xffffffff, p - 1,
-                             p / 2,  p / 3 + 1};
+  const uint64_t values[] = {1,          2,          3,     65536, 12345,
+                             0xdeadbeef, 0xffffffff, p - 1, p / 2, p / 3 + 1};
   for (uint64_t a : values) {
     a %= p;
     if (a == 0)
@@ -47,8 +46,7 @@ void mulFull(uint64_t *r, const uint64_t *a, const uint64_t *b, size_t n) {
   for (size_t i = 0; i < n; ++i) {
     uint64_t carry = 0;
     for (size_t j = 0; j < n; ++j) {
-      unsigned __int128 t =
-          (unsigned __int128)a[i] * b[j] + r[i + j] + carry;
+      unsigned __int128 t = (unsigned __int128)a[i] * b[j] + r[i + j] + carry;
       r[i + j] = (uint64_t)t;
       carry = (uint64_t)(t >> 64);
     }
@@ -117,7 +115,8 @@ void checkInverse(const uint64_t *a, const uint64_t *p, size_t n) {
 //===--------------------------------------------------------------------===//
 
 void testBN254() {
-  // p = 21888242871839275222246405745257275088548364400416034343698204186575808495617
+  // p =
+  // 21888242871839275222246405745257275088548364400416034343698204186575808495617
   const uint64_t p[4] = {0x43E1F593F0000001ULL, 0x2833E84879B97091ULL,
                          0xB85045B68181585DULL, 0x30644E72E131A029ULL};
 

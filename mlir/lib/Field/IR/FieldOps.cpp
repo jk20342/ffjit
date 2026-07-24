@@ -49,8 +49,8 @@ static Value makeLiteral(PatternRewriter &rewriter, Location loc,
                          ElementType elem, const APInt &value) {
   auto intTy = rewriter.getIntegerType(elem.getStorageBitWidth());
   APInt v = value.zextOrTrunc(elem.getStorageBitWidth());
-  Value cst = rewriter.create<arith::ConstantOp>(loc,
-                                                 IntegerAttr::get(intTy, v));
+  Value cst =
+      rewriter.create<arith::ConstantOp>(loc, IntegerAttr::get(intTy, v));
   return rewriter.create<FromIntOp>(loc, elem, cst);
 }
 
@@ -80,8 +80,7 @@ struct AddCanon : OpRewritePattern<AddOp> {
       APInt p = modulusOf(op.getResult(), w);
       APInt sum = (l.zext(w) + r.zext(w)).urem(p);
       rewriter.replaceOp(op, makeLiteral(rewriter, op.getLoc(),
-                                         cast<ElementType>(op.getType()),
-                                         sum));
+                                         cast<ElementType>(op.getType()), sum));
       return success();
     }
     return failure();
@@ -95,8 +94,8 @@ struct SubCanon : OpRewritePattern<SubOp> {
     auto elem = cast<ElementType>(op.getType());
     // x - x -> 0
     if (op.getLhs() == op.getRhs()) {
-      rewriter.replaceOp(op, makeLiteral(rewriter, op.getLoc(), elem,
-                                         APInt::getZero(1)));
+      rewriter.replaceOp(
+          op, makeLiteral(rewriter, op.getLoc(), elem, APInt::getZero(1)));
       return success();
     }
     APInt l, r;
@@ -112,8 +111,7 @@ struct SubCanon : OpRewritePattern<SubOp> {
       unsigned w = std::max(l.getBitWidth(), r.getBitWidth()) + 1;
       APInt p = modulusOf(op.getResult(), w);
       APInt diff = (l.zext(w) + p - r.zext(w)).urem(p);
-      rewriter.replaceOp(op,
-                         makeLiteral(rewriter, op.getLoc(), elem, diff));
+      rewriter.replaceOp(op, makeLiteral(rewriter, op.getLoc(), elem, diff));
       return success();
     }
     return failure();
@@ -153,9 +151,9 @@ struct MulCanon : OpRewritePattern<MulOp> {
       unsigned w = l.getBitWidth() + r.getBitWidth();
       APInt p = modulusOf(op.getResult(), w);
       APInt prod = (l.zext(w) * r.zext(w)).urem(p);
-      rewriter.replaceOp(op, makeLiteral(rewriter, op.getLoc(),
-                                         cast<ElementType>(op.getType()),
-                                         prod));
+      rewriter.replaceOp(op,
+                         makeLiteral(rewriter, op.getLoc(),
+                                     cast<ElementType>(op.getType()), prod));
       return success();
     }
     return failure();
@@ -178,8 +176,7 @@ struct NegCanon : OpRewritePattern<NegOp> {
       APInt p = modulusOf(op.getResult(), w);
       APInt neg = (p - c.zext(w)).urem(p);
       rewriter.replaceOp(op, makeLiteral(rewriter, op.getLoc(),
-                                         cast<ElementType>(op.getType()),
-                                         neg));
+                                         cast<ElementType>(op.getType()), neg));
       return success();
     }
     return failure();

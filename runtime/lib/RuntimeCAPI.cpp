@@ -55,8 +55,7 @@ int cmp(const uint64_t *a, const uint64_t *b, size_t n) {
 uint64_t add(uint64_t *r, const uint64_t *a, const uint64_t *b, size_t n) {
   uint64_t carry = 0;
   for (size_t i = 0; i < n; ++i) {
-    unsigned __int128 s =
-        (unsigned __int128)a[i] + b[i] + carry;
+    unsigned __int128 s = (unsigned __int128)a[i] + b[i] + carry;
     r[i] = (uint64_t)s;
     carry = (uint64_t)(s >> 64);
   }
@@ -67,8 +66,7 @@ uint64_t add(uint64_t *r, const uint64_t *a, const uint64_t *b, size_t n) {
 uint64_t sub(uint64_t *r, const uint64_t *a, const uint64_t *b, size_t n) {
   uint64_t borrow = 0;
   for (size_t i = 0; i < n; ++i) {
-    unsigned __int128 d =
-        (unsigned __int128)a[i] - b[i] - borrow;
+    unsigned __int128 d = (unsigned __int128)a[i] - b[i] - borrow;
     r[i] = (uint64_t)d;
     borrow = (uint64_t)((d >> 64) & 1);
   }
@@ -127,8 +125,7 @@ int32_t ff_rt_abi_version(void) { return 1; }
 void ff_rt_inv(uint64_t *out, const uint64_t *a, const uint64_t *modulus,
                size_t nlimbs) {
   if (nlimbs == 0 || nlimbs > kMaxLimbs) {
-    std::fprintf(stderr,
-                 "ff_rt_inv: unsupported nlimbs=%zu (must be 1..%zu)\n",
+    std::fprintf(stderr, "ff_rt_inv: unsupported nlimbs=%zu (must be 1..%zu)\n",
                  nlimbs, kMaxLimbs);
     std::abort();
   }

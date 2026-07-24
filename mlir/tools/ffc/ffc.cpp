@@ -75,8 +75,7 @@ int main(int argc, char **argv) {
   registerAllPasses();
   ffjit::field::registerFieldPasses();
 
-  OwningOpRef<ModuleOp> module =
-      parseSourceFile<ModuleOp>(inputFile, &context);
+  OwningOpRef<ModuleOp> module = parseSourceFile<ModuleOp>(inputFile, &context);
   if (!module) {
     llvm::errs() << "ffc: failed to parse " << inputFile << "\n";
     return 1;
@@ -86,11 +85,11 @@ int main(int argc, char **argv) {
   // canonicalize first: field-level algebraic identities (x*1, x+0, x*0,
   // constant folding) are far cheaper to apply before each op expands into
   // wide-integer Montgomery arithmetic.
-  std::string pipeline = "canonicalize,convert-field-to-arith{montgomery=" +
-                         montStr +
-                         "},convert-scf-to-cf,convert-arith-to-llvm,"
-                         "convert-cf-to-llvm,convert-func-to-llvm,"
-                         "reconcile-unrealized-casts";
+  std::string pipeline =
+      "canonicalize,convert-field-to-arith{montgomery=" + montStr +
+      "},convert-scf-to-cf,convert-arith-to-llvm,"
+      "convert-cf-to-llvm,convert-func-to-llvm,"
+      "reconcile-unrealized-casts";
 
   PassManager pm(&context);
   if (failed(parsePassPipeline(pipeline, pm))) {
