@@ -1,0 +1,17 @@
+# local-only: reference clone and working notes
+catalyst/
+doc/THEORY.md
+
+mlir/build/
+runtime/build/
+__pycache__/
+*.egg-info/
+.ffjit_cache/
+.venv/
+.pytest_cache/
+.hypothesis/
+*.o
+*.so
+mlir/test/**/Output/
+mlir/test/**/.lit_test_times.txt
+.lit_test_times.txt

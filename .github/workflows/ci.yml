@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/MLIR 21
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          sudo apt-get install -y libmlir-21-dev mlir-21-tools ninja-build cmake
+
+      - name: Install Python dependencies
+        run: python3 -m pip install --user pytest hypothesis numpy
+
+      - name: Build MLIR tools and runtime
+        run: make mlir runtime
+
+      - name: Run all test suites
+        run: make test
+
+      - name: Demo smoke test
+        run: make demo
+
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install linters
+        run: python3 -m pip install --user ruff && sudo apt-get install -y clang-format
+      - name: ruff
+        run: python3 -m ruff check frontend benchmark demos
+      - name: clang-format
+        run: |
+          find mlir/lib mlir/include mlir/tools runtime -name '*.cpp' -o -name '*.h' \
+            | xargs clang-format --dry-run --Werror

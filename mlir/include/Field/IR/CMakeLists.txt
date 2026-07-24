@@ -1,0 +1,11 @@
+set(LLVM_TARGET_DEFINITIONS FieldOps.td)
+mlir_tablegen(FieldOps.h.inc -gen-op-decls)
+mlir_tablegen(FieldOps.cpp.inc -gen-op-defs)
+mlir_tablegen(FieldOpsTypes.h.inc -gen-typedef-decls)
+mlir_tablegen(FieldOpsTypes.cpp.inc -gen-typedef-defs)
+mlir_tablegen(FieldOpsDialect.h.inc -gen-dialect-decls)
+mlir_tablegen(FieldOpsDialect.cpp.inc -gen-dialect-defs)
+add_public_tablegen_target(FFJITFieldOpsIncGen)
+
+add_mlir_doc(FieldDialect FieldDialect Field/ -gen-dialect-doc)
+add_mlir_doc(FieldOps FieldOps Field/ -gen-op-doc)

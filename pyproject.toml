@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ffjit"
+version = "0.1.0"
+description = "MLIR-based JIT compiler for prime-field arithmetic in Python (arbitrary-size moduli)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+keywords = ["finite-field", "JIT", "MLIR", "cryptography", "zero-knowledge"]
+
+[project.optional-dependencies]
+test = ["pytest", "hypothesis"]
+
+[tool.setuptools.packages.find]
+where = ["frontend"]
+include = ["ffjit*"]
+
+[tool.setuptools.package-data]
+ffjit = ["py.typed"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # long lines in generated-IR string builders are clearer unwrapped
+    "E741",  # I is the standard EFD variable name in the add formulas
+]
